@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GloomApi - Документация</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 40px 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 50px;
+        }
+
+        .header h1 {
+            font-size: 3em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+
+        .card {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        .card h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+            font-size: 1.8em;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
+
+        .card h3 {
+            color: #764ba2;
+            margin: 25px 0 15px 0;
+            font-size: 1.4em;
+        }
+
+        .code-block {
+            background: #2d3748;
+            color: #e2e8f0;
+            padding: 20px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 15px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            line-height: 1.5;
+        }
+
+        .code-block code {
+            color: #68d391;
+        }
+
+        .param {
+            background: #f7fafc;
+            border-left: 4px solid #667eea;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+
+        .param strong {
+            color: #667eea;
+            font-size: 1.1em;
+        }
+
+        .param p {
+            margin-top: 5px;
+            color: #4a5568;
+        }
+
+        .params-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+
+        .param-item {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: bold;
+        }
+
+        .note {
+            background: #fef5e7;
+            border-left: 4px solid #f39c12;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }
+
+        .note strong {
+            color: #f39c12;
+        }
+
+        .endpoint {
+            background: #e8f5e9;
+            border-left: 4px solid #4caf50;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }
+
+        .endpoint strong {
+            color: #4caf50;
+        }
+
+        .response {
+            background: #e3f2fd;
+            border-left: 4px solid #2196f3;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }
+
+        .response strong {
+            color: #2196f3;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔍 GloomApi</h1>
+            <p>Универсальное API для поиска по данным</p>
+        </div>
+
+        <div class="card">
+            <h2>📡 Основной Endpoint</h2>
+            <div class="endpoint">
+                <strong>POST /search</strong>
+            </div>
+            <p>Все запросы отправляются на этот endpoint с JSON телом.</p>
+        </div>
+
+        <div class="card">
+            <h2>🔑 Аутентификация</h2>
+            <h3>Создание API ключа</h3>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/key \
+  -H "Content-Type: application/json" \
+  -d '{"name": "MyKey", "days": 30, "limit": 10000}'</code>
+            </div>
+            <div class="response">
+                <strong>Ответ:</strong> JSON с ключом для использования в запросах
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📱 Поиск по телефону</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"phone": "+79001234567"}'</code>
+            </div>
+            <div class="param">
+                <strong>phone</strong>
+                <p>Номер телефона в международном формате (+79001234567)</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📧 Поиск по email</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"email": "user@mail.ru"}'</code>
+            </div>
+            <div class="param">
+                <strong>email</strong>
+                <p>Email адрес пользователя</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>👤 Поиск по никнейму</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"nick": "username"}'</code>
+            </div>
+            <div class="param">
+                <strong>nick</strong>
+                <p>Никнейм или логин пользователя</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>👤 Поиск по имени</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"name": "Иван"}'</code>
+            </div>
+            <div class="params-grid">
+                <div class="param-item">name</div>
+                <div class="param-item">first_name</div>
+                <div class="param-item">last_name</div>
+                <div class="param-item">fio</div>
+                <div class="param-item">fullname</div>
+            </div>
+            <p>Различные варианты параметров для поиска по имени пользователя</p>
+        </div>
+
+        <div class="card">
+            <h2>🎓 Поиск по документам</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"passport": "1234 567890"}'</code>
+            </div>
+            <div class="params-grid">
+                <div class="param-item">passport</div>
+                <div class="param-item">inn</div>
+                <div class="param-item">snils</div>
+            </div>
+            <p>Поиск по паспортным данным, ИНН, СНИЛС</p>
+        </div>
+
+        <div class="card">
+            <h2>🚗 Поиск по автомобилям</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"vin": "WBA12345678901234"}'</code>
+            </div>
+            <div class="params-grid">
+                <div class="param-item">vin</div>
+                <div class="param-item">car_number</div>
+            </div>
+            <p>Поиск по VIN коду или номеру автомобиля</p>
+        </div>
+
+        <div class="card">
+            <h2>🌐 Поиск по IP</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"ip": "192.168.1.1"}'</code>
+            </div>
+            <div class="param">
+                <strong>ip</strong>
+                <p>IP адрес пользователя</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>💬 Поиск по Telegram</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"telegram": "@username"}'</code>
+            </div>
+            <div class="params-grid">
+                <div class="param-item">telegram</div>
+                <div class="param-item">telegram_id</div>
+                <div class="param-item">username</div>
+            </div>
+            <p>Поиск по username или ID Telegram</p>
+        </div>
+
+        <div class="card">
+            <h2>🔵 Поиск по VK</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"vk": "id123456789"}'</code>
+            </div>
+            <div class="params-grid">
+                <div class="param-item">vk</div>
+                <div class="param-item">vk_id</div>
+            </div>
+            <p>Поиск по ID пользователя VK (id123456789 или 123456789)</p>
+        </div>
+
+        <div class="card">
+            <h2>💳 Поиск по карте</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"card": "4111111111111111"}'</code>
+            </div>
+            <div class="param">
+                <strong>card</strong>
+                <p>Номер банковской карты</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📱 Поиск по IMEI</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"imei": "123456789012345"}'</code>
+            </div>
+            <div class="param">
+                <strong>imei</strong>
+                <p>IMEI код устройства</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>🏠 Поиск по адресу</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"address": "Москва, ул. Пушкина, д. 10"}'</code>
+            </div>
+            <div class="param">
+                <strong>address</strong>
+                <p>Адрес проживания</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>🌐 Поиск по социальным сетям</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"social": "facebook.com/user"}'</code>
+            </div>
+            <div class="param">
+                <strong>social</strong>
+                <p>Ссылка на профиль в социальных сетях</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📅 Поиск по дате рождения</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"bdate": "01.01.1990"}'</code>
+            </div>
+            <div class="param">
+                <strong>bdate</strong>
+                <p>Дата рождения пользователя</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>🌐 Поиск по домену</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"domain": "example.com"}'</code>
+            </div>
+            <div class="param">
+                <strong>domain</strong>
+                <p>Доменное имя</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📸 Поиск по фото</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"photo_url": "https://example.com/photo.jpg"}'</code>
+            </div>
+            <div class="param">
+                <strong>photo_url</strong>
+                <p>URL изображения для поиска лиц</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>💾 Сохранение результата в файл</h2>
+            <div class="code-block">
+                <code>curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"phone": "+79001234567", "output_file": "result.json"}'</code>
+            </div>
+            <div class="param">
+                <strong>output_file</strong>
+                <p>Путь к файлу для сохранения результатов поиска</p>
+            </div>
+            <div class="note">
+                <strong>Примечание:</strong> Результат будет сохранён в указанный файл в формате JSON
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📋 Все доступные параметры</h2>
+            <div class="params-grid">
+                <div class="param-item">phone</div>
+                <div class="param-item">email</div>
+                <div class="param-item">nick</div>
+                <div class="param-item">username</div>
+                <div class="param-item">name</div>
+                <div class="param-item">first_name</div>
+                <div class="param-item">last_name</div>
+                <div class="param-item">fio</div>
+                <div class="param-item">fullname</div>
+                <div class="param-item">passport</div>
+                <div class="param-item">inn</div>
+                <div class="param-item">snils</div>
+                <div class="param-item">vin</div>
+                <div class="param-item">car_number</div>
+                <div class="param-item">ip</div>
+                <div class="param-item">telegram</div>
+                <div class="param-item">telegram_id</div>
+                <div class="param-item">vk</div>
+                <div class="param-item">vk_id</div>
+                <div class="param-item">card</div>
+                <div class="param-item">imei</div>
+                <div class="param-item">address</div>
+                <div class="param-item">social</div>
+                <div class="param-item">number</div>
+                <div class="param-item">bdate</div>
+                <div class="param-item">domain</div>
+                <div class="param-item">photo_url</div>
+                <div class="param-item">output_file</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📊 Формат ответа</h2>
+            <div class="code-block">
+                <code>{
+  "success": true,
+  "results": [
+    {
+      "source": "service_name",
+      "field": "phone",
+      "value": "+79001234567",
+      "found": true,
+      "data": {...}
+    }
+  ],
+  "total": 1,
+  "timestamp": "2026-07-30T17:00:00.000000",
+  "query_params": {"phone": "+79001234567"}
+}</code>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
