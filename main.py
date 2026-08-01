@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from sqlalchemy.sql import func
@@ -147,6 +147,8 @@ class KeyStatsResponse(BaseModel):
     total_searches: int
 
 class KeyResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
     id: int
     key: str
     name: str
@@ -155,9 +157,6 @@ class KeyResponse(BaseModel):
     search_limit: Optional[int]
     searches_used: int
     status: str
-    
-    class Config:
-        from_attributes = True
 
 # ============================================================================
 # API КЛЮЧИ ИЗ РЕСУРСОВ
@@ -827,6 +826,31 @@ def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security), d
 # FASTAPI
 # ============================================================================
 
+# Глобальный экземпляр бота
+bot_manager = None
+bot_task = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager для управления ботом"""
+    global bot_manager, bot_task
+    # Startup
+    init_db()
+    
+    if TELEGRAM_BOT_TOKEN:
+        bot_manager = TelegramBotManager()
+        bot_task = asyncio.create_task(bot_manager.run_async())
+    
+    yield
+    
+    # Shutdown
+    if bot_task:
+        bot_task.cancel()
+        try:
+            await bot_task
+        except asyncio.CancelledError:
+            pass
+
 app = FastAPI(title="GloomApi - Search API", version="2.0", lifespan=lifespan)
 
 # CORS
@@ -1313,31 +1337,6 @@ class TelegramBotManager:
             await self.application.updater.stop()
             await self.application.stop()
             await self.application.shutdown()
-
-# Глобальный экземпляр бота
-bot_manager = None
-bot_task = None
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan context manager для управления ботом"""
-    global bot_manager, bot_task
-    # Startup
-    init_db()
-    
-    if TELEGRAM_BOT_TOKEN:
-        bot_manager = TelegramBotManager()
-        bot_task = asyncio.create_task(bot_manager.run_async())
-    
-    yield
-    
-    # Shutdown
-    if bot_task:
-        bot_task.cancel()
-        try:
-            await bot_task
-        except asyncio.CancelledError:
-            pass
 
 if __name__ == "__main__":
     import uvicorn
