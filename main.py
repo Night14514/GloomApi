@@ -10,6 +10,7 @@ Unified Search API - Простой поиск по данным
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from pydantic import BaseModel
@@ -826,7 +827,7 @@ def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security), d
 # FASTAPI
 # ============================================================================
 
-app = FastAPI(title="GloomApi - Search API", version="2.0")
+app = FastAPI(title="GloomApi - Search API", version="2.0", lifespan=lifespan)
 
 # CORS
 app.add_middleware(
@@ -836,11 +837,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.on_event("startup")
-async def startup_event():
-    """Инициализация базы данных при запуске"""
-    init_db()
 
 # Инициализация всех поисковых модулей
 search_modules = [
@@ -1285,7 +1281,7 @@ class TelegramBotManager:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
     
     async def run_async(self):
-        """Асинхронный запуск бота"""
+        """Асинхронный запуск бота с polling"""
         if not TELEGRAM_BOT_TOKEN:
             print("⚠️ TELEGRAM_BOT_TOKEN не установлен. Бот не запущен.")
             return
@@ -1302,15 +1298,18 @@ class TelegramBotManager:
         print("✅ Telegram бот запускается...")
         await self.application.initialize()
         await self.application.start()
-        await self.application.updater.start_polling()
         
-        # Бесконечный цикл
+        # Запуск polling (современный метод PTB 20+)
+        await self.application.updater.start_polling(drop_pending_updates=True)
+        
+        # Бесконечный цикл для поддержания работы
         try:
-            while self.application.updater.running:
+            while self.application.updater.is_running:
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             pass
         finally:
+            print("🛑 Остановка Telegram бота...")
             await self.application.updater.stop()
             await self.application.stop()
             await self.application.shutdown()
@@ -1319,20 +1318,20 @@ class TelegramBotManager:
 bot_manager = None
 bot_task = None
 
-@app.on_event("startup")
-async def startup_event():
-    """Инициализация при запуске"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager для управления ботом"""
     global bot_manager, bot_task
+    # Startup
     init_db()
     
     if TELEGRAM_BOT_TOKEN:
         bot_manager = TelegramBotManager()
         bot_task = asyncio.create_task(bot_manager.run_async())
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Очистка при остановке"""
-    global bot_task
+    
+    yield
+    
+    # Shutdown
     if bot_task:
         bot_task.cancel()
         try:
