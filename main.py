@@ -1051,102 +1051,17 @@ class TelegramBotManager:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка команды /start"""
         user_id = update.effective_user.id
+        print(f"🚀 ENTER start_command for user {user_id}")
         
-        if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
-            await update.message.reply_text(
-                "🚫 У вас нет доступа к этому боту.\n"
-                "Свяжитесь с администратором для получения доступа."
-            )
-            return
-        
-        keyboard = [
-            [InlineKeyboardButton("🔑 Создать ключ", callback_data="create_key")],
-            [InlineKeyboardButton("📋 Мои ключи", callback_data="list_keys")],
-            [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-            [InlineKeyboardButton("❓ Помощь", callback_data="help")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            "👋 Добро пожаловать в GloomApi Bot!\n\n"
-            "🔍 Универсальное API для поиска по данным\n\n"
-            "Выберите действие:",
-            reply_markup=reply_markup
-        )
-    
-    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка нажатий на кнопки"""
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = update.effective_user.id
-        
-        if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
-            await query.edit_message_text("🚫 Нет доступа")
-            return
-        
-        data = query.data
-        
-        if data == "create_key":
-            context.user_data["state"] = "creating_key_name"
-            await query.edit_message_text(
-                "🔑 Создание нового ключа\n\n"
-                "Введите название для ключа:"
-            )
-        
-        elif data == "list_keys":
-            db = self.get_db()
-            keys = db.query(APIKey).filter(APIKey.created_by == user_id).all()
-            
-            if not keys:
-                await query.edit_message_text("📋 У вас нет созданных ключей")
+        try:
+            if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
+                await update.message.reply_text(
+                    "🚫 У вас нет доступа к этому боту.\n"
+                    "Свяжитесь с администратором для получения доступа."
+                )
+                print(f"✅ EXIT start_command for user {user_id} (access denied)")
                 return
             
-            text = "📋 Ваши ключи:\n\n"
-            for key in keys:
-                status_emoji = "✅" if key.status == "active" else "❌"
-                text += f"{status_emoji} <b>{key.name}</b>\n"
-                text += f"   Ключ: <code>sk_{key.key[:8]}...{key.key[-4:]}</code>\n"
-                text += f"   Использовано: {key.searches_used}"
-                if key.search_limit:
-                    text += f"/{key.search_limit}"
-                text += "\n"
-                if key.expires_at:
-                    text += f"   Истекает: {key.expires_at.strftime('%d.%m.%Y %H:%M')}\n"
-                text += "\n"
-            
-            keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
-        
-        elif data == "stats":
-            db = self.get_db()
-            total_keys = db.query(APIKey).count()
-            active_keys = db.query(APIKey).filter(APIKey.status == "active").count()
-            total_searches = db.query(APIKey).with_entities(func.sum(APIKey.searches_used)).scalar() or 0
-            
-            text = "📊 Статистика системы:\n\n"
-            text += f"🔑 Всего ключей: {total_keys}\n"
-            text += f"✅ Активных ключей: {active_keys}\n"
-            text += f"🔍 Всего поисков: {total_searches}\n"
-            
-            keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(text, reply_markup=reply_markup)
-        
-        elif data == "help":
-            text = "❓ Помощь\n\n"
-            text += "🔑 <b>Создать ключ</b> - Создать новый API ключ\n"
-            text += "📋 <b>Мои ключи</b> - Посмотреть список ваших ключей\n"
-            text += "📊 <b>Статистика</b> - Общая статистика системы\n\n"
-            text += "Для использования ключа в запросах:\n"
-            text += "<code>Authorization: Bearer YOUR_API_KEY</code>\n"
-            
-            keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
-        
-        elif data == "menu":
             keyboard = [
                 [InlineKeyboardButton("🔑 Создать ключ", callback_data="create_key")],
                 [InlineKeyboardButton("📋 Мои ключи", callback_data="list_keys")],
@@ -1154,189 +1069,336 @@ class TelegramBotManager:
                 [InlineKeyboardButton("❓ Помощь", callback_data="help")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.edit_message_text(
-                "👋 Главное меню\n\nВыберите действие:",
+            
+            await update.message.reply_text(
+                "👋 Добро пожаловать в GloomApi Bot!\n\n"
+                "🔍 Универсальное API для поиска по данным\n\n"
+                "Выберите действие:",
                 reply_markup=reply_markup
             )
+            
+            print(f"✅ EXIT start_command for user {user_id}")
+        except Exception as e:
+            print(f"❌ ERROR in start_command for user {user_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка нажатий на кнопки"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        data = query.data
+        print(f"🚀 ENTER button_callback for user {user_id}, data: {data}")
+        
+        try:
+            if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
+                await query.edit_message_text("🚫 Нет доступа")
+                print(f"✅ EXIT button_callback for user {user_id} (access denied)")
+                return
+            
+            if data == "create_key":
+                context.user_data["state"] = "creating_key_name"
+                await query.edit_message_text(
+                    "🔑 Создание нового ключа\n\n"
+                    "Введите название для ключа:"
+                )
+            
+            elif data == "list_keys":
+                db = self.get_db()
+                keys = db.query(APIKey).filter(APIKey.created_by == user_id).all()
+                
+                if not keys:
+                    await query.edit_message_text("📋 У вас нет созданных ключей")
+                    print(f"✅ EXIT button_callback for user {user_id} (no keys)")
+                    return
+                
+                text = "📋 Ваши ключи:\n\n"
+                for key in keys:
+                    status_emoji = "✅" if key.status == "active" else "❌"
+                    text += f"{status_emoji} <b>{key.name}</b>\n"
+                    text += f"   Ключ: <code>sk_{key.key[:8]}...{key.key[-4:]}</code>\n"
+                    text += f"   Использовано: {key.searches_used}"
+                    if key.search_limit:
+                        text += f"/{key.search_limit}"
+                    text += "\n"
+                    if key.expires_at:
+                        text += f"   Истекает: {key.expires_at.strftime('%d.%m.%Y %H:%M')}\n"
+                    text += "\n"
+                
+                keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+            
+            elif data == "stats":
+                db = self.get_db()
+                total_keys = db.query(APIKey).count()
+                active_keys = db.query(APIKey).filter(APIKey.status == "active").count()
+                total_searches = db.query(APIKey).with_entities(func.sum(APIKey.searches_used)).scalar() or 0
+                
+                text = "📊 Статистика системы:\n\n"
+                text += f"🔑 Всего ключей: {total_keys}\n"
+                text += f"✅ Активных ключей: {active_keys}\n"
+                text += f"🔍 Всего поисков: {total_searches}\n"
+                
+                keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(text, reply_markup=reply_markup)
+            
+            elif data == "help":
+                text = "❓ Помощь\n\n"
+                text += "🔑 <b>Создать ключ</b> - Создать новый API ключ\n"
+                text += "📋 <b>Мои ключи</b> - Посмотреть список ваших ключей\n"
+                text += "📊 <b>Статистика</b> - Общая статистика системы\n\n"
+                text += "Для использования ключа в запросах:\n"
+                text += "<code>Authorization: Bearer YOUR_API_KEY</code>\n"
+                
+                keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+            
+            elif data == "menu":
+                keyboard = [
+                    [InlineKeyboardButton("🔑 Создать ключ", callback_data="create_key")],
+                    [InlineKeyboardButton("📋 Мои ключи", callback_data="list_keys")],
+                    [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+                    [InlineKeyboardButton("❓ Помощь", callback_data="help")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(
+                    "👋 Главное меню\n\nВыберите действие:",
+                    reply_markup=reply_markup
+                )
+            
+            print(f"✅ EXIT button_callback for user {user_id}")
+        except Exception as e:
+            print(f"❌ ERROR in button_callback for user {user_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     async def message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка текстовых сообщений"""
         user_id = update.effective_user.id
         text = update.message.text
         state = context.user_data.get("state")
+        print(f"🚀 ENTER message_handler for user {user_id}, state: {state}, text: {text[:30]}")
         
-        if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
-            await update.message.reply_text("🚫 Нет доступа")
-            return
-        
-        if state == "creating_key_name":
-            context.user_data["key_name"] = text
-            context.user_data["state"] = "creating_key_days"
+        try:
+            if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
+                await update.message.reply_text("🚫 Нет доступа")
+                print(f"✅ EXIT message_handler for user {user_id} (access denied)")
+                return
             
-            keyboard = [
-                [InlineKeyboardButton("7 дней", callback_data="days_7")],
-                [InlineKeyboardButton("30 дней", callback_data="days_30")],
-                [InlineKeyboardButton("90 дней", callback_data="days_90")],
-                [InlineKeyboardButton("Без ограничений", callback_data="days_0")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.message.reply_text(
-                f"📝 Название: {text}\n\n"
-                "⏰ Выберите срок действия ключа:",
-                reply_markup=reply_markup
-            )
-        
-        elif state == "creating_key_limit":
-            try:
-                limit = int(text)
-                if limit < 1:
-                    await update.message.reply_text("❌ Лимит должен быть положительным числом")
-                    return
+            if state == "creating_key_name":
+                context.user_data["key_name"] = text
+                context.user_data["state"] = "creating_key_days"
                 
-                context.user_data["key_limit"] = limit
-                
-                # Создаем ключ
-                db = self.get_db()
-                key_value = f"sk_{secrets.token_urlsafe(32)}"
-                key_hash = hash_key(key_value)
-                
-                days = context.user_data.get("key_days", 30)
-                expires_at = datetime.utcnow() + timedelta(days=days) if days > 0 else None
-                
-                api_key = APIKey(
-                    key=key_value,
-                    key_hash=key_hash,
-                    name=context.user_data["key_name"],
-                    expires_at=expires_at,
-                    search_limit=limit,
-                    created_by=user_id
-                )
-                db.add(api_key)
-                db.commit()
-                db.refresh(api_key)
-                
-                text = f"✅ Ключ успешно создан!\n\n"
-                text += f"🔑 <b>Ваш API ключ:</b>\n"
-                text += f"<code>{key_value}</code>\n\n"
-                text += f"📝 Название: {api_key.name}\n"
-                if expires_at:
-                    text += f"⏰ Истекает: {expires_at.strftime('%d.%m.%Y %H:%M')}\n"
-                text += f"🔍 Лимит поисков: {limit}\n\n"
-                text += "⚠️ Сохраните этот ключ, он больше не будет показан!"
-                
-                keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
+                keyboard = [
+                    [InlineKeyboardButton("7 дней", callback_data="days_7")],
+                    [InlineKeyboardButton("30 дней", callback_data="days_30")],
+                    [InlineKeyboardButton("90 дней", callback_data="days_90")],
+                    [InlineKeyboardButton("Без ограничений", callback_data="days_0")]
+                ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
-                context.user_data.clear()
-                await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
-                
-            except ValueError:
-                await update.message.reply_text("❌ Введите корректное число")
+                await update.message.reply_text(
+                    f"📝 Название: {text}\n\n"
+                    "⏰ Выберите срок действия ключа:",
+                    reply_markup=reply_markup
+                )
+                print(f"✅ EXIT message_handler for user {user_id} (creating_key_name)")
+            
+            elif state == "creating_key_limit":
+                try:
+                    limit = int(text)
+                    if limit < 1:
+                        await update.message.reply_text("❌ Лимит должен быть положительным числом")
+                        print(f"⚠️ EXIT message_handler for user {user_id} (invalid limit)")
+                        return
+                    
+                    context.user_data["key_limit"] = limit
+                    
+                    # Создаем ключ
+                    db = self.get_db()
+                    key_value = f"sk_{secrets.token_urlsafe(32)}"
+                    key_hash = hash_key(key_value)
+                    
+                    days = context.user_data.get("key_days", 30)
+                    expires_at = datetime.utcnow() + timedelta(days=days) if days > 0 else None
+                    
+                    api_key = APIKey(
+                        key=key_value,
+                        key_hash=key_hash,
+                        name=context.user_data["key_name"],
+                        expires_at=expires_at,
+                        search_limit=limit,
+                        created_by=user_id
+                    )
+                    db.add(api_key)
+                    db.commit()
+                    db.refresh(api_key)
+                    
+                    text = f"✅ Ключ успешно создан!\n\n"
+                    text += f"🔑 <b>Ваш API ключ:</b>\n"
+                    text += f"<code>{key_value}</code>\n\n"
+                    text += f"📝 Название: {api_key.name}\n"
+                    if expires_at:
+                        text += f"⏰ Истекает: {expires_at.strftime('%d.%m.%Y %H:%M')}\n"
+                    text += f"🔍 Лимит поисков: {limit}\n\n"
+                    text += "⚠️ Сохраните этот ключ, он больше не будет показан!"
+                    
+                    keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    context.user_data.clear()
+                    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
+                    print(f"✅ EXIT message_handler for user {user_id} (key created)")
+                    
+                except ValueError:
+                    await update.message.reply_text("❌ Введите корректное число")
+                    print(f"⚠️ EXIT message_handler for user {user_id} (invalid number)")
+            
+            print(f"✅ EXIT message_handler for user {user_id}")
+        except Exception as e:
+            print(f"❌ ERROR in message_handler for user {user_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     async def days_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка выбора срока действия"""
         query = update.callback_query
         await query.answer()
         
+        user_id = update.effective_user.id
         days_str = query.data.replace("days_", "")
         days = int(days_str)
-        context.user_data["key_days"] = days
+        print(f"🚀 ENTER days_callback for user {user_id}, days: {days}")
         
-        context.user_data["state"] = "creating_key_limit"
-        
-        keyboard = [
-            [InlineKeyboardButton("100", callback_data="limit_100")],
-            [InlineKeyboardButton("1000", callback_data="limit_1000")],
-            [InlineKeyboardButton("10000", callback_data="limit_10000")],
-            [InlineKeyboardButton("Безлимит", callback_data="limit_0")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            f"⏰ Срок: {days if days > 0 else 'Без ограничений'} дней\n\n"
-            "🔢 Выберите лимит поисков или введите своё число:",
-            reply_markup=reply_markup
-        )
+        try:
+            context.user_data["key_days"] = days
+            
+            context.user_data["state"] = "creating_key_limit"
+            
+            keyboard = [
+                [InlineKeyboardButton("100", callback_data="limit_100")],
+                [InlineKeyboardButton("1000", callback_data="limit_1000")],
+                [InlineKeyboardButton("10000", callback_data="limit_10000")],
+                [InlineKeyboardButton("Безлимит", callback_data="limit_0")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"⏰ Срок: {days if days > 0 else 'Без ограничений'} дней\n\n"
+                "🔢 Выберите лимит поисков или введите своё число:",
+                reply_markup=reply_markup
+            )
+            
+            print(f"✅ EXIT days_callback for user {user_id}")
+        except Exception as e:
+            print(f"❌ ERROR in days_callback for user {user_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     async def limit_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка выбора лимита"""
         query = update.callback_query
         await query.answer()
         
+        user_id = update.effective_user.id
         limit_str = query.data.replace("limit_", "")
         limit = int(limit_str) if limit_str != "0" else None
+        print(f"🚀 ENTER limit_callback for user {user_id}, limit: {limit}")
         
-        context.user_data["key_limit"] = limit
-        
-        # Создаем ключ
-        db = self.get_db()
-        key_value = f"sk_{secrets.token_urlsafe(32)}"
-        key_hash = hash_key(key_value)
-        
-        days = context.user_data.get("key_days", 30)
-        expires_at = datetime.utcnow() + timedelta(days=days) if days > 0 else None
-        
-        api_key = APIKey(
-            key=key_value,
-            key_hash=key_hash,
-            name=context.user_data["key_name"],
-            expires_at=expires_at,
-            search_limit=limit,
-            created_by=query.from_user.id
-        )
-        db.add(api_key)
-        db.commit()
-        db.refresh(api_key)
-        
-        text = f"✅ Ключ успешно создан!\n\n"
-        text += f"🔑 <b>Ваш API ключ:</b>\n"
-        text += f"<code>{key_value}</code>\n\n"
-        text += f"📝 Название: {api_key.name}\n"
-        if expires_at:
-            text += f"⏰ Истекает: {expires_at.strftime('%d.%m.%Y %H:%M')}\n"
-        text += f"🔍 Лимит поисков: {limit if limit else 'Безлимит'}\n\n"
-        text += "⚠️ Сохраните этот ключ, он больше не будет показан!"
-        
-        keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        context.user_data.clear()
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+        try:
+            context.user_data["key_limit"] = limit
+            
+            # Создаем ключ
+            db = self.get_db()
+            key_value = f"sk_{secrets.token_urlsafe(32)}"
+            key_hash = hash_key(key_value)
+            
+            days = context.user_data.get("key_days", 30)
+            expires_at = datetime.utcnow() + timedelta(days=days) if days > 0 else None
+            
+            api_key = APIKey(
+                key=key_value,
+                key_hash=key_hash,
+                name=context.user_data["key_name"],
+                expires_at=expires_at,
+                search_limit=limit,
+                created_by=query.from_user.id
+            )
+            db.add(api_key)
+            db.commit()
+            db.refresh(api_key)
+            
+            text = f"✅ Ключ успешно создан!\n\n"
+            text += f"🔑 <b>Ваш API ключ:</b>\n"
+            text += f"<code>{key_value}</code>\n\n"
+            text += f"📝 Название: {api_key.name}\n"
+            if expires_at:
+                text += f"⏰ Истекает: {expires_at.strftime('%d.%m.%Y %H:%M')}\n"
+            text += f"🔍 Лимит поисков: {limit if limit else 'Безлимит'}\n\n"
+            text += "⚠️ Сохраните этот ключ, он больше не будет показан!"
+            
+            keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            context.user_data.clear()
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+            
+            print(f"✅ EXIT limit_callback for user {user_id}")
+        except Exception as e:
+            print(f"❌ ERROR in limit_callback for user {user_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     async def run_async(self):
         """Асинхронный запуск бота с polling"""
+        import traceback
+        
         if not TELEGRAM_BOT_TOKEN:
             print("⚠️ TELEGRAM_BOT_TOKEN не установлен. Бот не запущен.")
             return
         
-        self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        
-        # Регистрация обработчиков
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CallbackQueryHandler(self.button_callback, pattern="^(create_key|list_keys|stats|help|menu)$"))
-        self.application.add_handler(CallbackQueryHandler(self.days_callback, pattern="^days_"))
-        self.application.add_handler(CallbackQueryHandler(self.limit_callback, pattern="^limit_"))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_handler))
-        
-        print("✅ Telegram бот запускается...")
-        await self.application.initialize()
-        await self.application.start()
-        
-        # Запуск polling (современный метод PTB 20+)
-        await self.application.updater.start_polling(drop_pending_updates=True)
-        
-        # Бесконечный цикл для поддержания работы
         try:
-            while self.application.updater.is_running:
-                await asyncio.sleep(1)
+            print("🔧 Создание Application...")
+            self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+            print("✅ Application создан")
+            
+            # Регистрация обработчиков
+            print("📝 Регистрация обработчиков...")
+            self.application.add_handler(CommandHandler("start", self.start_command))
+            self.application.add_handler(CallbackQueryHandler(self.button_callback, pattern="^(create_key|list_keys|stats|help|menu)$"))
+            self.application.add_handler(CallbackQueryHandler(self.days_callback, pattern="^days_"))
+            self.application.add_handler(CallbackQueryHandler(self.limit_callback, pattern="^limit_"))
+            self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_handler))
+            print("✅ Обработчики зарегистрированы")
+            
+            # Запуск polling (современный метод PTB 20+)
+            print("🚀 Запуск polling...")
+            await self.application.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES
+            )
         except asyncio.CancelledError:
-            pass
+            print("🛑 Polling отменен (CancelledError)")
+            raise
+        except Exception as e:
+            print(f"❌ Ошибка в polling: {e}")
+            print(f"📋 Traceback:\n{traceback.format_exc()}")
+            raise
         finally:
             print("🛑 Остановка Telegram бота...")
-            await self.application.updater.stop()
-            await self.application.stop()
-            await self.application.shutdown()
+            if self.application:
+                await self.application.shutdown()
+            print("✅ Telegram бот остановлен")
 
 if __name__ == "__main__":
     import uvicorn
