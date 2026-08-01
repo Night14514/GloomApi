@@ -1360,7 +1360,7 @@ class TelegramBotManager:
             raise
     
     async def run_async(self):
-        """Асинхронный запуск бота с polling"""
+        """Асинхронный запуск бота с polling для FastAPI"""
         import traceback
         
         if not TELEGRAM_BOT_TOKEN:
@@ -1381,12 +1381,25 @@ class TelegramBotManager:
             self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_handler))
             print("✅ Обработчики зарегистрированы")
             
-            # Запуск polling (современный метод PTB 20+)
-            print("🚀 Запуск polling...")
-            await self.application.run_polling(
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES
-            )
+            # Инициализация и запуск в существующем event loop
+            print("🚀 Инициализация Application...")
+            await self.application.initialize()
+            print("✅ Application инициализирован")
+            
+            print("🚀 Запуск Application...")
+            await self.application.start()
+            print("✅ Application запущен")
+            
+            # Запуск polling через updater
+            print("🚀 Запуск polling через updater...")
+            await self.application.updater.start_polling(drop_pending_updates=True)
+            print("✅ Polling запущен")
+            
+            # Бесконечный цикл для поддержания работы
+            print("🔄 Бот работает в режиме polling...")
+            while self.application.updater.is_running:
+                await asyncio.sleep(1)
+                
         except asyncio.CancelledError:
             print("🛑 Polling отменен (CancelledError)")
             raise
@@ -1397,6 +1410,9 @@ class TelegramBotManager:
         finally:
             print("🛑 Остановка Telegram бота...")
             if self.application:
+                if self.application.updater.is_running:
+                    await self.application.updater.stop()
+                await self.application.stop()
                 await self.application.shutdown()
             print("✅ Telegram бот остановлен")
 
