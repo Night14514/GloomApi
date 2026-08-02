@@ -1281,15 +1281,21 @@ class TelegramBotManager:
                         text += f"   Истекает: {key.expires_at.strftime('%d.%m.%Y %H:%M')}\n"
                     text += "\n"
                     
-                    # Добавляем кнопки для управления ключом (только для админов)
+                    # Добавляем кнопки для управления ключом
+                    key_buttons = []
                     if ADMIN_TELEGRAM_IDS and user_id in ADMIN_TELEGRAM_IDS:
-                        key_buttons = []
+                        # Админы видят все кнопки
                         if key.status == "active":
                             key_buttons.append(InlineKeyboardButton("🚫 Деактивировать", callback_data=f"deactivate_key_{key.id}"))
                         else:
                             key_buttons.append(InlineKeyboardButton("✅ Активировать", callback_data=f"activate_key_{key.id}"))
                         key_buttons.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{key.id}"))
                         key_buttons.append(InlineKeyboardButton("📊 Логи", callback_data=f"key_logs_{key.id}"))
+                    elif key.created_by == user_id:
+                        # Владелец ключа может только удалить свой ключ
+                        key_buttons.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{key.id}"))
+                    
+                    if key_buttons:
                         keyboard.append(key_buttons)
                 
                 keyboard.append([InlineKeyboardButton("↩️ Меню", callback_data="menu")])
@@ -1372,21 +1378,26 @@ class TelegramBotManager:
                     await query.answer("Ключ не найден", show_alert=True)
             
             elif data.startswith("delete_key_"):
-                if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
-                    await query.answer("Нет доступа", show_alert=True)
-                    return
-                
                 key_id = int(data.split("_")[-1])
                 db = self.get_db()
                 key = db.query(APIKey).filter(APIKey.id == key_id).first()
+                
+                if not key:
+                    await query.answer("Ключ не найден", show_alert=True)
+                    return
+                
+                # Проверка прав: админы могут удалять любые ключи, пользователи - только свои
+                if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
+                    if key.created_by != user_id:
+                        await query.answer("Нет доступа", show_alert=True)
+                        return
+                
                 if key:
                     db.delete(key)
                     db.commit()
                     await query.answer("Ключ удален")
                     # Обновляем список
                     await self.button_callback(update, context)
-                else:
-                    await query.answer("Ключ не найден", show_alert=True)
             
             elif data.startswith("key_logs_"):
                 if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
