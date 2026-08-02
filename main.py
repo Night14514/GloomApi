@@ -1202,7 +1202,7 @@ class TelegramBotManager:
             if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
                 await update.message.reply_text(
                     "🚫 У вас нет доступа к этому боту.\n"
-                    "Свяжитесь с администратором для получения доступа."
+                    "Этот бот доступен только для администраторов."
                 )
                 print(f"✅ EXIT start_command for user {user_id} (access denied)")
                 return
@@ -1240,7 +1240,7 @@ class TelegramBotManager:
         
         try:
             if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
-                await query.edit_message_text("🚫 Нет доступа")
+                await query.edit_message_text("🚫 Этот бот доступен только для администраторов.")
                 print(f"✅ EXIT button_callback for user {user_id} (access denied)")
                 return
             
@@ -1253,20 +1253,15 @@ class TelegramBotManager:
             
             elif data == "list_keys":
                 db = self.get_db()
-                # Показываем все ключи для админов, только свои для обычных пользователей
-                if ADMIN_TELEGRAM_IDS and user_id in ADMIN_TELEGRAM_IDS:
-                    keys = db.query(APIKey).all()
-                    title = "📋 Все ключи:"
-                else:
-                    keys = db.query(APIKey).filter(APIKey.created_by == user_id).all()
-                    title = "📋 Ваши ключи:"
+                # Показываем все ключи (только для админов)
+                keys = db.query(APIKey).all()
                 
                 if not keys:
                     await query.edit_message_text("📋 Нет созданных ключей")
                     print(f"✅ EXIT button_callback for user {user_id} (no keys)")
                     return
                 
-                text = f"{title}\n\n"
+                text = "📋 Все ключи:\n\n"
                 keyboard = []
                 
                 for key in keys:
@@ -1283,20 +1278,13 @@ class TelegramBotManager:
                     
                     # Добавляем кнопки для управления ключом
                     key_buttons = []
-                    if ADMIN_TELEGRAM_IDS and user_id in ADMIN_TELEGRAM_IDS:
-                        # Админы видят все кнопки
-                        if key.status == "active":
-                            key_buttons.append(InlineKeyboardButton("🚫 Деактивировать", callback_data=f"deactivate_key_{key.id}"))
-                        else:
-                            key_buttons.append(InlineKeyboardButton("✅ Активировать", callback_data=f"activate_key_{key.id}"))
-                        key_buttons.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{key.id}"))
-                        key_buttons.append(InlineKeyboardButton("📊 Логи", callback_data=f"key_logs_{key.id}"))
-                    elif key.created_by == user_id:
-                        # Владелец ключа может только удалить свой ключ
-                        key_buttons.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{key.id}"))
-                    
-                    if key_buttons:
-                        keyboard.append(key_buttons)
+                    if key.status == "active":
+                        key_buttons.append(InlineKeyboardButton("🚫 Деактивировать", callback_data=f"deactivate_key_{key.id}"))
+                    else:
+                        key_buttons.append(InlineKeyboardButton("✅ Активировать", callback_data=f"activate_key_{key.id}"))
+                    key_buttons.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{key.id}"))
+                    key_buttons.append(InlineKeyboardButton("📊 Логи", callback_data=f"key_logs_{key.id}"))
+                    keyboard.append(key_buttons)
                 
                 keyboard.append([InlineKeyboardButton("↩️ Меню", callback_data="menu")])
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1342,12 +1330,8 @@ class TelegramBotManager:
                     reply_markup=reply_markup
                 )
             
-            # Обработка действий с ключами (только для админов)
+            # Обработка действий с ключами
             elif data.startswith("deactivate_key_"):
-                if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
-                    await query.answer("Нет доступа", show_alert=True)
-                    return
-                
                 key_id = int(data.split("_")[-1])
                 db = self.get_db()
                 key = db.query(APIKey).filter(APIKey.id == key_id).first()
@@ -1361,10 +1345,6 @@ class TelegramBotManager:
                     await query.answer("Ключ не найден", show_alert=True)
             
             elif data.startswith("activate_key_"):
-                if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
-                    await query.answer("Нет доступа", show_alert=True)
-                    return
-                
                 key_id = int(data.split("_")[-1])
                 db = self.get_db()
                 key = db.query(APIKey).filter(APIKey.id == key_id).first()
@@ -1386,23 +1366,13 @@ class TelegramBotManager:
                     await query.answer("Ключ не найден", show_alert=True)
                     return
                 
-                # Проверка прав: админы могут удалять любые ключи, пользователи - только свои
-                if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
-                    if key.created_by != user_id:
-                        await query.answer("Нет доступа", show_alert=True)
-                        return
-                
-                if key:
-                    db.delete(key)
-                    db.commit()
-                    await query.answer("Ключ удален")
-                    # Обновляем список
-                    await self.button_callback(update, context)
+                db.delete(key)
+                db.commit()
+                await query.answer("Ключ удален")
+                # Обновляем список
+                await self.button_callback(update, context)
             
             elif data.startswith("key_logs_"):
-                if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
-                    await query.answer("Нет доступа", show_alert=True)
-                    return
                 
                 key_id = int(data.split("_")[-1])
                 db = self.get_db()
@@ -1445,7 +1415,7 @@ class TelegramBotManager:
         
         try:
             if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
-                await update.message.reply_text("🚫 Нет доступа")
+                await update.message.reply_text("🚫 Этот бот доступен только для администраторов.")
                 print(f"✅ EXIT message_handler for user {user_id} (access denied)")
                 return
             
