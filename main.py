@@ -94,6 +94,7 @@ class SearchLog(Base):
     results_count = Column(Integer, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     api_key = relationship("APIKey", back_populates="search_logs")
+    source_api_key = Column(Text, nullable=True)  # Which API key was used for the search (e.g., jitler key)
 
 # Создание таблиц (отложено до запуска приложения)
 def init_db():
@@ -177,10 +178,44 @@ RAIDFIND_API_KEY = "rf_live_e7285c81c1334de11b211dbda0f81b1e9729c81ecb7589f0"
 VK_TOKEN = "0af157510af157510af15751aa0a89e69600af10af157516a0bc15996e74fe2b440998c"
 VK_API_VERSION = "5.199"
 TRUECALLER_INSTALLATION_ID = "a1i2N--Ql8rEHHVAS8AVeQ"
+INFINITY_SEARCH_TOKEN = "Bjm928HUcvsw923ZMBX19gd110FWSZgd"
+INFINITY_SEARCH_URL = "https://infinity-search.fun"
 
 # ============================================================================
 # ПОИСКОВЫЕ МОДУЛИ ДЛЯ КАЖДОГО API
 # ============================================================================
+
+class APIKeyLoadBalancer:
+    """Load balancer for API keys - distributes requests evenly"""
+    
+    def __init__(self, keys: List[str]):
+        self.keys = keys
+        self.current_index = 0
+        self.usage_count = {key: 0 for key in keys}
+        self.lock = threading.Lock()
+    
+    def get_next_key(self) -> str:
+        """Get next key using round-robin with least usage"""
+        with self.lock:
+            # Find key with least usage
+            min_usage = min(self.usage_count.values())
+            candidates = [k for k, v in self.usage_count.items() if v == min_usage]
+            
+            # Select from candidates using round-robin
+            selected_key = candidates[self.current_index % len(candidates)]
+            self.current_index = (self.current_index + 1) % len(candidates)
+            
+            # Increment usage
+            self.usage_count[selected_key] += 1
+            
+            return selected_key
+    
+    def get_usage_stats(self) -> Dict[str, int]:
+        """Get usage statistics for all keys"""
+        return self.usage_count.copy()
+
+# Initialize load balancers for multi-key APIs
+jitler_load_balancer = APIKeyLoadBalancer(JITLER_KEYS)
 
 class BaseSearchModule:
     """Базовый класс для поисковых модулей"""
@@ -194,7 +229,7 @@ class JitlerSearchModule(BaseSearchModule):
     
     def __init__(self):
         self.base_url = "https://api.jitler.top"
-        self.keys = JITLER_KEYS
+        self.load_balancer = jitler_load_balancer
     
     def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
         results = []
@@ -202,7 +237,7 @@ class JitlerSearchModule(BaseSearchModule):
         # Поиск по номеру телефона
         if params.get("phone"):
             try:
-                key = random.choice(self.keys)
+                key = self.load_balancer.get_next_key()
                 response = requests.post(
                     f"{self.base_url}/search",
                     json={"type": "number", "query": params["phone"]},
@@ -216,7 +251,8 @@ class JitlerSearchModule(BaseSearchModule):
                         "field": "phone",
                         "value": params["phone"],
                         "found": True,
-                        "data": data
+                        "data": data,
+                        "api_key": key[:8] + "..."  # Track which key was used
                     })
             except Exception as e:
                 results.append({
@@ -231,7 +267,7 @@ class JitlerSearchModule(BaseSearchModule):
         if params.get("vk") or params.get("vk_id"):
             vk_id = params.get("vk") or params.get("vk_id")
             try:
-                key = random.choice(self.keys)
+                key = self.load_balancer.get_next_key()
                 response = requests.post(
                     f"{self.base_url}/search",
                     json={"type": "vk", "query": vk_id},
@@ -245,7 +281,8 @@ class JitlerSearchModule(BaseSearchModule):
                         "field": "vk",
                         "value": vk_id,
                         "found": True,
-                        "data": data
+                        "data": data,
+                        "api_key": key[:8] + "..."  # Track which key was used
                     })
             except Exception as e:
                 results.append({
@@ -260,7 +297,7 @@ class JitlerSearchModule(BaseSearchModule):
         if params.get("telegram") or params.get("telegram_id"):
             tg = params.get("telegram") or params.get("telegram_id")
             try:
-                key = random.choice(self.keys)
+                key = self.load_balancer.get_next_key()
                 response = requests.post(
                     f"{self.base_url}/search",
                     json={"type": "telegram", "query": tg},
@@ -274,7 +311,8 @@ class JitlerSearchModule(BaseSearchModule):
                         "field": "telegram",
                         "value": tg,
                         "found": True,
-                        "data": data
+                        "data": data,
+                        "api_key": key[:8] + "..."  # Track which key was used
                     })
             except Exception as e:
                 results.append({
@@ -722,6 +760,98 @@ class TruecallerModule(BaseSearchModule):
         
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
+class InfinitySearchModule(BaseSearchModule):
+    """Infinity Search API - поиск по телефону, email, ФИО"""
+    
+    def __init__(self):
+        self.base_url = INFINITY_SEARCH_URL
+        self.token = INFINITY_SEARCH_TOKEN
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        # Поиск по телефону
+        if params.get("phone"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/find.php",
+                    params={"phone": params["phone"], "token": self.token},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "infinity_search",
+                        "field": "phone",
+                        "value": params["phone"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "infinity_search",
+                    "field": "phone",
+                    "value": params["phone"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        # Поиск по ФИО
+        if params.get("fio") or params.get("fullname") or params.get("name"):
+            fio = params.get("fio") or params.get("fullname") or params.get("name")
+            try:
+                from urllib.parse import quote
+                response = requests.get(
+                    f"{self.base_url}/find.php",
+                    params={"fio": quote(fio), "token": self.token},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "infinity_search",
+                        "field": "fio",
+                        "value": fio,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "infinity_search",
+                    "field": "fio",
+                    "value": fio,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        # Поиск по email
+        if params.get("email"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/find.php",
+                    params={"email": params["email"], "token": self.token},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "infinity_search",
+                        "field": "email",
+                        "value": params["email"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "infinity_search",
+                    "field": "email",
+                    "value": params["email"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
 class FaceSearchModule(BaseSearchModule):
     """Face Search API - поиск лиц по фото (detect-faces, search-faces)"""
     
@@ -871,6 +1001,7 @@ search_modules = [
     RaidFindModule(),
     VKAPIModule(),
     TruecallerModule(),
+    InfinitySearchModule(),
     FaceSearchModule()
 ]
 
@@ -888,11 +1019,18 @@ async def search(request: SearchRequest, api_key: APIKey = Depends(get_api_key),
     
     # Поиск по всем модулям
     all_results = []
+    source_api_keys = set()  # Track which API keys were used
+    
     for module in search_modules:
         try:
             result = module.search(params)
             if result.get("success"):
-                all_results.extend(result.get("results", []))
+                results = result.get("results", [])
+                all_results.extend(results)
+                # Extract API keys used from results
+                for r in results:
+                    if "api_key" in r:
+                        source_api_keys.add(r["api_key"])
         except Exception as e:
             all_results.append({
                 "source": module.__class__.__name__,
@@ -902,7 +1040,13 @@ async def search(request: SearchRequest, api_key: APIKey = Depends(get_api_key),
     
     # Логирование
     api_key.searches_used += 1
-    db.add(SearchLog(api_key_id=api_key.id, search_params=json.dumps(params), results_count=len(all_results)))
+    source_api_key_str = ", ".join(source_api_keys) if source_api_keys else None
+    db.add(SearchLog(
+        api_key_id=api_key.id, 
+        search_params=json.dumps(params), 
+        results_count=len(all_results),
+        source_api_key=source_api_key_str
+    ))
     db.commit()
     
     response_data = {
@@ -1108,14 +1252,22 @@ class TelegramBotManager:
             
             elif data == "list_keys":
                 db = self.get_db()
-                keys = db.query(APIKey).filter(APIKey.created_by == user_id).all()
+                # Показываем все ключи для админов, только свои для обычных пользователей
+                if ADMIN_TELEGRAM_IDS and user_id in ADMIN_TELEGRAM_IDS:
+                    keys = db.query(APIKey).all()
+                    title = "📋 Все ключи:"
+                else:
+                    keys = db.query(APIKey).filter(APIKey.created_by == user_id).all()
+                    title = "📋 Ваши ключи:"
                 
                 if not keys:
-                    await query.edit_message_text("📋 У вас нет созданных ключей")
+                    await query.edit_message_text("📋 Нет созданных ключей")
                     print(f"✅ EXIT button_callback for user {user_id} (no keys)")
                     return
                 
-                text = "📋 Ваши ключи:\n\n"
+                text = f"{title}\n\n"
+                keyboard = []
+                
                 for key in keys:
                     status_emoji = "✅" if key.status == "active" else "❌"
                     text += f"{status_emoji} <b>{key.name}</b>\n"
@@ -1127,8 +1279,19 @@ class TelegramBotManager:
                     if key.expires_at:
                         text += f"   Истекает: {key.expires_at.strftime('%d.%m.%Y %H:%M')}\n"
                     text += "\n"
+                    
+                    # Добавляем кнопки для управления ключом (только для админов)
+                    if ADMIN_TELEGRAM_IDS and user_id in ADMIN_TELEGRAM_IDS:
+                        key_buttons = []
+                        if key.status == "active":
+                            key_buttons.append(InlineKeyboardButton("🚫 Деактивировать", callback_data=f"deactivate_key_{key.id}"))
+                        else:
+                            key_buttons.append(InlineKeyboardButton("✅ Активировать", callback_data=f"activate_key_{key.id}"))
+                        key_buttons.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{key.id}"))
+                        key_buttons.append(InlineKeyboardButton("📊 Логи", callback_data=f"key_logs_{key.id}"))
+                        keyboard.append(key_buttons)
                 
-                keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
+                keyboard.append([InlineKeyboardButton("↩️ Меню", callback_data="menu")])
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
             
@@ -1172,6 +1335,88 @@ class TelegramBotManager:
                     reply_markup=reply_markup
                 )
             
+            # Обработка действий с ключами (только для админов)
+            elif data.startswith("deactivate_key_"):
+                if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
+                    await query.answer("Нет доступа", show_alert=True)
+                    return
+                
+                key_id = int(data.split("_")[-1])
+                db = self.get_db()
+                key = db.query(APIKey).filter(APIKey.id == key_id).first()
+                if key:
+                    key.status = "inactive"
+                    db.commit()
+                    await query.answer("Ключ деактивирован")
+                    # Обновляем список
+                    await self.button_callback(update, context)
+                else:
+                    await query.answer("Ключ не найден", show_alert=True)
+            
+            elif data.startswith("activate_key_"):
+                if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
+                    await query.answer("Нет доступа", show_alert=True)
+                    return
+                
+                key_id = int(data.split("_")[-1])
+                db = self.get_db()
+                key = db.query(APIKey).filter(APIKey.id == key_id).first()
+                if key:
+                    key.status = "active"
+                    db.commit()
+                    await query.answer("Ключ активирован")
+                    # Обновляем список
+                    await self.button_callback(update, context)
+                else:
+                    await query.answer("Ключ не найден", show_alert=True)
+            
+            elif data.startswith("delete_key_"):
+                if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
+                    await query.answer("Нет доступа", show_alert=True)
+                    return
+                
+                key_id = int(data.split("_")[-1])
+                db = self.get_db()
+                key = db.query(APIKey).filter(APIKey.id == key_id).first()
+                if key:
+                    db.delete(key)
+                    db.commit()
+                    await query.answer("Ключ удален")
+                    # Обновляем список
+                    await self.button_callback(update, context)
+                else:
+                    await query.answer("Ключ не найден", show_alert=True)
+            
+            elif data.startswith("key_logs_"):
+                if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
+                    await query.answer("Нет доступа", show_alert=True)
+                    return
+                
+                key_id = int(data.split("_")[-1])
+                db = self.get_db()
+                key = db.query(APIKey).filter(APIKey.id == key_id).first()
+                if key:
+                    logs = db.query(SearchLog).filter(SearchLog.api_key_id == key_id).order_by(SearchLog.created_at.desc()).limit(20).all()
+                    
+                    text = f"📊 Логи ключа: {key.name}\n\n"
+                    if not logs:
+                        text += "Нет записей"
+                    else:
+                        for log in logs:
+                            params = json.loads(log.search_params)
+                            text += f"🔍 {log.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+                            text += f"   Параметры: {', '.join(params.keys())}\n"
+                            text += f"   Результатов: {log.results_count}\n"
+                            if log.source_api_key:
+                                text += f"   API ключ: {log.source_api_key}\n"
+                            text += "\n"
+                    
+                    keyboard = [[InlineKeyboardButton("↩️ Назад к ключам", callback_data="list_keys")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await query.edit_message_text(text, reply_markup=reply_markup)
+                else:
+                    await query.answer("Ключ не найден", show_alert=True)
+            
             print(f"✅ EXIT button_callback for user {user_id}")
         except Exception as e:
             print(f"❌ ERROR in button_callback for user {user_id}: {e}")
@@ -1200,7 +1445,10 @@ class TelegramBotManager:
                     [InlineKeyboardButton("7 дней", callback_data="days_7")],
                     [InlineKeyboardButton("30 дней", callback_data="days_30")],
                     [InlineKeyboardButton("90 дней", callback_data="days_90")],
-                    [InlineKeyboardButton("Без ограничений", callback_data="days_0")]
+                    [InlineKeyboardButton("180 дней", callback_data="days_180")],
+                    [InlineKeyboardButton("365 дней", callback_data="days_365")],
+                    [InlineKeyboardButton("Без ограничений", callback_data="days_0")],
+                    [InlineKeyboardButton("✏️ Свое число дней", callback_data="days_custom")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
@@ -1210,6 +1458,36 @@ class TelegramBotManager:
                     reply_markup=reply_markup
                 )
                 print(f"✅ EXIT message_handler for user {user_id} (creating_key_name)")
+            
+            elif state == "creating_key_days_custom":
+                try:
+                    days = int(text)
+                    if days < 1:
+                        await update.message.reply_text("❌ Количество дней должно быть положительным числом")
+                        print(f"⚠️ EXIT message_handler for user {user_id} (invalid days)")
+                        return
+                    
+                    context.user_data["key_days"] = days
+                    context.user_data["state"] = "creating_key_limit"
+                    
+                    keyboard = [
+                        [InlineKeyboardButton("100", callback_data="limit_100")],
+                        [InlineKeyboardButton("1000", callback_data="limit_1000")],
+                        [InlineKeyboardButton("10000", callback_data="limit_10000")],
+                        [InlineKeyboardButton("Безлимит", callback_data="limit_0")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    await update.message.reply_text(
+                        f"⏰ Срок: {days} дней\n\n"
+                        "🔢 Выберите лимит поисков или введите своё число:",
+                        reply_markup=reply_markup
+                    )
+                    print(f"✅ EXIT message_handler for user {user_id} (custom days)")
+                    
+                except ValueError:
+                    await update.message.reply_text("❌ Введите корректное число")
+                    print(f"⚠️ EXIT message_handler for user {user_id} (invalid number)")
             
             elif state == "creating_key_limit":
                 try:
@@ -1275,10 +1553,19 @@ class TelegramBotManager:
         
         user_id = update.effective_user.id
         days_str = query.data.replace("days_", "")
-        days = int(days_str)
-        print(f"🚀 ENTER days_callback for user {user_id}, days: {days}")
+        
+        print(f"🚀 ENTER days_callback for user {user_id}, data: {query.data}")
         
         try:
+            if days_str == "custom":
+                context.user_data["state"] = "creating_key_days_custom"
+                await query.edit_message_text(
+                    "✏️ Введите количество дней (число):"
+                )
+                print(f"✅ EXIT days_callback for user {user_id} (custom days)")
+                return
+            
+            days = int(days_str)
             context.user_data["key_days"] = days
             
             context.user_data["state"] = "creating_key_limit"
