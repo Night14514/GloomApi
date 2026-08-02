@@ -1339,8 +1339,35 @@ class TelegramBotManager:
                     key.status = "inactive"
                     db.commit()
                     await query.answer("Ключ деактивирован")
-                    # Обновляем список
-                    await self.button_callback(update, context)
+                    # Обновляем список напрямую без рекурсии
+                    keys = db.query(APIKey).all()
+                    text = "📋 Все ключи:\n\n"
+                    keyboard = []
+                    
+                    for k in keys:
+                        status_emoji = "✅" if k.status == "active" else "❌"
+                        text += f"{status_emoji} <b>{k.name}</b>\n"
+                        text += f"   Ключ: <code>sk_{k.key[:8]}...{k.key[-4:]}</code>\n"
+                        text += f"   Использовано: {k.searches_used}"
+                        if k.search_limit:
+                            text += f"/{k.search_limit}"
+                        text += "\n"
+                        if k.expires_at:
+                            text += f"   Истекает: {k.expires_at.strftime('%d.%m.%Y %H:%M')}\n"
+                        text += "\n"
+                        
+                        key_buttons = []
+                        if k.status == "active":
+                            key_buttons.append(InlineKeyboardButton("🚫 Деактивировать", callback_data=f"deactivate_key_{k.id}"))
+                        else:
+                            key_buttons.append(InlineKeyboardButton("✅ Активировать", callback_data=f"activate_key_{k.id}"))
+                        key_buttons.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{k.id}"))
+                        key_buttons.append(InlineKeyboardButton("📊 Логи", callback_data=f"key_logs_{k.id}"))
+                        keyboard.append(key_buttons)
+                    
+                    keyboard.append([InlineKeyboardButton("↩️ Меню", callback_data="menu")])
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
                 else:
                     await query.answer("Ключ не найден", show_alert=True)
             
@@ -1352,8 +1379,35 @@ class TelegramBotManager:
                     key.status = "active"
                     db.commit()
                     await query.answer("Ключ активирован")
-                    # Обновляем список
-                    await self.button_callback(update, context)
+                    # Обновляем список напрямую без рекурсии
+                    keys = db.query(APIKey).all()
+                    text = "📋 Все ключи:\n\n"
+                    keyboard = []
+                    
+                    for k in keys:
+                        status_emoji = "✅" if k.status == "active" else "❌"
+                        text += f"{status_emoji} <b>{k.name}</b>\n"
+                        text += f"   Ключ: <code>sk_{k.key[:8]}...{k.key[-4:]}</code>\n"
+                        text += f"   Использовано: {k.searches_used}"
+                        if k.search_limit:
+                            text += f"/{k.search_limit}"
+                        text += "\n"
+                        if k.expires_at:
+                            text += f"   Истекает: {k.expires_at.strftime('%d.%m.%Y %H:%M')}\n"
+                        text += "\n"
+                        
+                        key_buttons = []
+                        if k.status == "active":
+                            key_buttons.append(InlineKeyboardButton("🚫 Деактивировать", callback_data=f"deactivate_key_{k.id}"))
+                        else:
+                            key_buttons.append(InlineKeyboardButton("✅ Активировать", callback_data=f"activate_key_{k.id}"))
+                        key_buttons.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{k.id}"))
+                        key_buttons.append(InlineKeyboardButton("📊 Логи", callback_data=f"key_logs_{k.id}"))
+                        keyboard.append(key_buttons)
+                    
+                    keyboard.append([InlineKeyboardButton("↩️ Меню", callback_data="menu")])
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
                 else:
                     await query.answer("Ключ не найден", show_alert=True)
             
@@ -1369,8 +1423,40 @@ class TelegramBotManager:
                 db.delete(key)
                 db.commit()
                 await query.answer("Ключ удален")
-                # Обновляем список
-                await self.button_callback(update, context)
+                # Обновляем список напрямую без рекурсии
+                keys = db.query(APIKey).all()
+                
+                if not keys:
+                    await query.edit_message_text("📋 Нет созданных ключей")
+                    return
+                
+                text = "📋 Все ключи:\n\n"
+                keyboard = []
+                
+                for k in keys:
+                    status_emoji = "✅" if k.status == "active" else "❌"
+                    text += f"{status_emoji} <b>{k.name}</b>\n"
+                    text += f"   Ключ: <code>sk_{k.key[:8]}...{k.key[-4:]}</code>\n"
+                    text += f"   Использовано: {k.searches_used}"
+                    if k.search_limit:
+                        text += f"/{k.search_limit}"
+                    text += "\n"
+                    if k.expires_at:
+                        text += f"   Истекает: {k.expires_at.strftime('%d.%m.%Y %H:%M')}\n"
+                    text += "\n"
+                    
+                    key_buttons = []
+                    if k.status == "active":
+                        key_buttons.append(InlineKeyboardButton("🚫 Деактивировать", callback_data=f"deactivate_key_{k.id}"))
+                    else:
+                        key_buttons.append(InlineKeyboardButton("✅ Активировать", callback_data=f"activate_key_{k.id}"))
+                    key_buttons.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{k.id}"))
+                    key_buttons.append(InlineKeyboardButton("📊 Логи", callback_data=f"key_logs_{k.id}"))
+                    keyboard.append(key_buttons)
+                
+                keyboard.append([InlineKeyboardButton("↩️ Меню", callback_data="menu")])
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
             
             elif data.startswith("key_logs_"):
                 
