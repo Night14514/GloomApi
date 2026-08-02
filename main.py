@@ -1644,7 +1644,7 @@ class TelegramBotManager:
             # Регистрация обработчиков
             print("📝 Регистрация обработчиков...")
             self.application.add_handler(CommandHandler("start", self.start_command))
-            self.application.add_handler(CallbackQueryHandler(self.button_callback, pattern="^(create_key|list_keys|stats|help|menu|deactivate_key_|activate_key_|delete_key_|key_logs_)"))
+            self.application.add_handler(CallbackQueryHandler(self.button_callback))
             self.application.add_handler(CallbackQueryHandler(self.days_callback, pattern="^days_"))
             self.application.add_handler(CallbackQueryHandler(self.limit_callback, pattern="^limit_"))
             self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_handler))
