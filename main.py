@@ -182,6 +182,18 @@ TRUECALLER_INSTALLATION_ID = "a1i2N--Ql8rEHHVAS8AVeQ"
 INFINITY_SEARCH_TOKEN = "Bjm928HUcvsw923ZMBX19gd110FWSZgd"
 INFINITY_SEARCH_URL = "https://infinity-search.fun"
 
+# New API keys
+DEEPSCAN_KEYS = [
+    "deepscan_8900730363:8REhy4bY",
+    "deepscan_572562339:ejLjxG7q"
+]
+BIGBASE_API_KEY = "yhWCFGkla7-lT4ldeiIkVgFVYtHauETM"
+BIGBASE_API_URL = "https://bigbase.top/api"
+ONUX_API_TOKEN = "On-OmXimXvxsPwbNO4C"
+ONUX_API_URL = "https://api.onux.dev"
+TULASAY_API_TOKEN = "jg_torL_hDxjW-QRI2Gi063d_gOo8iWD8GaKQLC5fmqrBbuXW0K"
+TULASAY_API_URL = "https://tulasay.ru/api/v1"
+
 # ============================================================================
 # ПОИСКОВЫЕ МОДУЛИ ДЛЯ КАЖДОГО API
 # ============================================================================
@@ -217,6 +229,7 @@ class APIKeyLoadBalancer:
 
 # Initialize load balancers for multi-key APIs
 jitler_load_balancer = APIKeyLoadBalancer(JITLER_KEYS)
+deepscan_load_balancer = APIKeyLoadBalancer(DEEPSCAN_KEYS)
 
 class BaseSearchModule:
     """Базовый класс для поисковых модулей"""
@@ -920,6 +933,245 @@ class FaceSearchModule(BaseSearchModule):
         
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
+class DeepScanModule(BaseSearchModule):
+    """DeepScan API - поиск по телефону, email, ФИО, никнеймам"""
+    
+    def __init__(self):
+        self.base_url = "https://api.deepscan.cc"
+        self.load_balancer = deepscan_load_balancer
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        # Mapping параметров к типам поиска DeepScan
+        param_mapping = {
+            "phone": "phone",
+            "email": "email",
+            "fio": "fio",
+            "fullname": "fio",
+            "name": "fio",
+            "nick": "nick",
+            "username": "nick",
+            "vk": "vk",
+            "telegram": "telegram",
+            "ip": "ip"
+        }
+        
+        for local_param, search_type in param_mapping.items():
+            if params.get(local_param):
+                try:
+                    key = self.load_balancer.get_next_key()
+                    response = requests.post(
+                        f"{self.base_url}/search",
+                        json={"type": search_type, "query": params[local_param]},
+                        headers={"Authorization": f"Bearer {key}"},
+                        timeout=10
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        results.append({
+                            "source": "deepscan",
+                            "field": local_param,
+                            "value": params[local_param],
+                            "found": True,
+                            "data": data,
+                            "api_key": key[:8] + "..."
+                        })
+                except Exception as e:
+                    results.append({
+                        "source": "deepscan",
+                        "field": local_param,
+                        "value": params[local_param],
+                        "found": False,
+                        "error": str(e)
+                    })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class BigBaseModule(BaseSearchModule):
+    """BigBase API - универсальный поиск и открытие досье"""
+    
+    def __init__(self):
+        self.base_url = BIGBASE_API_URL
+        self.api_key = BIGBASE_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        # Mapping параметров к типам поиска BigBase
+        param_mapping = {
+            "phone": "phone",
+            "email": "email",
+            "fio": "fio",
+            "fullname": "fio",
+            "name": "fio",
+            "nick": "nick",
+            "vk": "vk",
+            "telegram": "telegram",
+            "ip": "ip",
+            "inn": "inn",
+            "snils": "snils",
+            "passport": "passport",
+            "vin": "vin",
+            "car_number": "car",
+            "address": "address"
+        }
+        
+        for local_param, search_type in param_mapping.items():
+            if params.get(local_param):
+                try:
+                    response = requests.post(
+                        f"{self.base_url}/search",
+                        json={"type": search_type, "query": params[local_param]},
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        timeout=10
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        results.append({
+                            "source": "bigbase",
+                            "field": local_param,
+                            "value": params[local_param],
+                            "found": True,
+                            "data": data
+                        })
+                except Exception as e:
+                    results.append({
+                        "source": "bigbase",
+                        "field": local_param,
+                        "value": params[local_param],
+                        "found": False,
+                        "error": str(e)
+                    })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class OnuxModule(BaseSearchModule):
+    """Onux API - универсальный поиск по различным параметрам"""
+    
+    def __init__(self):
+        self.base_url = ONUX_API_URL
+        self.token = ONUX_API_TOKEN
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        # Mapping параметров к типам поиска Onux
+        param_mapping = {
+            "phone": "phone",
+            "email": "email",
+            "fio": "fio",
+            "fullname": "fio",
+            "name": "fio",
+            "nick": "nick",
+            "vk": "vk",
+            "telegram": "tg",
+            "ip": "ip",
+            "inn": "inn",
+            "snils": "snils",
+            "passport": "passport",
+            "vin": "car",
+            "car_number": "car",
+            "ok": "ok",
+            "fb": "fb"
+        }
+        
+        for local_param, search_type in param_mapping.items():
+            if params.get(local_param):
+                try:
+                    response = requests.post(
+                        f"{self.base_url}/search",
+                        json={"type": search_type, "query": params[local_param]},
+                        headers={"X-API-Key": self.token},
+                        timeout=10
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        results.append({
+                            "source": "onux",
+                            "field": local_param,
+                            "value": params[local_param],
+                            "found": True,
+                            "data": data
+                        })
+                except Exception as e:
+                    results.append({
+                        "source": "onux",
+                        "field": local_param,
+                        "value": params[local_param],
+                        "found": False,
+                        "error": str(e)
+                    })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class TulasayModule(BaseSearchModule):
+    """Tulasay API - унифицированный поиск через JyCode Gateway"""
+    
+    def __init__(self):
+        self.base_url = TULASAY_API_URL
+        self.token = TULASAY_API_TOKEN
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        # Mapping параметров к типам поиска Tulasay
+        param_mapping = {
+            "phone": "phone",
+            "email": "email",
+            "fio": "fio",
+            "fullname": "fio",
+            "name": "fio",
+            "nick": "nick",
+            "username": "nick",
+            "vk": "vk",
+            "telegram": "telegram",
+            "ip": "ip",
+            "inn": "inn",
+            "snils": "snils",
+            "passport": "passport",
+            "vin": "auto_vehicle",
+            "car_number": "auto_vehicle",
+            "address": "address",
+            "card": "card",
+            "imei": "imei",
+            "bdate": "bdate",
+            "social": "social"
+        }
+        
+        for local_param, search_type in param_mapping.items():
+            if params.get(local_param):
+                try:
+                    response = requests.post(
+                        f"{self.base_url}/search",
+                        json={
+                            "query": params[local_param],
+                            "search_type": search_type,
+                            "auto": True
+                        },
+                        headers={"Authorization": f"Bearer {self.token}"},
+                        timeout=10
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        results.append({
+                            "source": "tulasay",
+                            "field": local_param,
+                            "value": params[local_param],
+                            "found": True,
+                            "data": data
+                        })
+                except Exception as e:
+                    results.append({
+                        "source": "tulasay",
+                        "field": local_param,
+                        "value": params[local_param],
+                        "found": False,
+                        "error": str(e)
+                    })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
 # ============================================================================
 # АУТЕНТИФИКАЦИЯ
 # ============================================================================
@@ -1003,7 +1255,11 @@ search_modules = [
     VKAPIModule(),
     TruecallerModule(),
     InfinitySearchModule(),
-    FaceSearchModule()
+    FaceSearchModule(),
+    DeepScanModule(),
+    BigBaseModule(),
+    OnuxModule(),
+    TulasayModule()
 ]
 
 # ============================================================================
@@ -1014,6 +1270,16 @@ search_modules = [
 async def search(request: SearchRequest, api_key: APIKey = Depends(get_api_key), db: Session = Depends(get_db)):
     params = {k: v for k, v in request.dict().items() if v is not None}
     output_file = params.pop("output_file", None)
+    
+    # Combine first_name and last_name into fio if both are provided but fio is not
+    if "first_name" in params and "last_name" in params and "fio" not in params and "fullname" not in params:
+        params["fio"] = f"{params['first_name']} {params['last_name']}"
+    
+    # Also handle case where only one of first_name/last_name is provided - use it as name
+    if "first_name" in params and "last_name" not in params and "fio" not in params and "fullname" not in params and "name" not in params:
+        params["fio"] = params["first_name"]
+    if "last_name" in params and "first_name" not in params and "fio" not in params and "fullname" not in params and "name" not in params:
+        params["fio"] = params["last_name"]
     
     if not params:
         raise HTTPException(status_code=400, detail="Укажите хотя бы один параметр")
