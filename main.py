@@ -39,9 +39,13 @@ load_dotenv()
 # ============================================================================
 
 # База данных для продакшена на bot.host.ru
-# Для сохранения ключей между деплоями используйте внешнюю PostgreSQL или постоянное хранилище
-# На bot.host.ru настройте DATABASE_URL в переменных окружения
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./search.db")
+# Используем SQLite с постоянным хранилищем для сохранения ключей между деплоями
+# Путь к постоянному хранилищю на хостинге
+# Локально для тестов используем временный каталог
+if os.path.exists("/data"):
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////data/gloomapi.db")
+else:
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./search.db")
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_TELEGRAM_IDS = [int(x) for x in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if x]
