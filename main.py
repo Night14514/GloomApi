@@ -240,6 +240,8 @@ ONUX_API_TOKEN = "On-OmXimXvxsPwbNO4C"
 ONUX_API_URL = "https://api.onux.dev"
 TULASAY_API_TOKEN = "jg_torL_hDxjW-QRI2Gi063d_gOo8iWD8GaKQLC5fmqrBbuXW0K"
 TULASAY_API_URL = "https://tulasay.ru/api/v1"
+REDMASK_API_KEY = "aTKg9SQ7IK42FlT8YL1p3"
+REDMASK_API_URL = "https://postauditory-indigenously-blakely.ngrok-free.dev/v1/search"
 
 # ============================================================================
 # ПОИСКОВЫЕ МОДУЛИ ДЛЯ КАЖДОГО API
@@ -1219,6 +1221,82 @@ class TulasayModule(BaseSearchModule):
         
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
+class RedMaskModule(BaseSearchModule):
+    """RedMask API - универсальный поиск по телефону, Telegram, VK"""
+    
+    def __init__(self):
+        self.base_url = REDMASK_API_URL
+        self.api_key = REDMASK_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        # RedMask поддерживает: телефон, Telegram username, Telegram ID, VK ID
+        query_mapping = {
+            "phone": "phone",
+            "telegram": "telegram",
+            "telegram_id": "telegram",
+            "vk": "vk",
+            "vk_id": "vk"
+        }
+        
+        for local_param, search_type in query_mapping.items():
+            if params.get(local_param):
+                query_value = params[local_param]
+                
+                # Форматируем запрос в соответствии с документацией RedMask
+                # Телефон: +79991234567
+                # Telegram: @username или username
+                # VK: id123456789
+                
+                if search_type == "phone":
+                    # Приводим телефон к формату +7...
+                    if not query_value.startswith("+"):
+                        query_value = f"+{query_value}"
+                elif search_type == "telegram":
+                    # Убираем @ если есть
+                    if query_value.startswith("@"):
+                        query_value = query_value[1:]
+                elif search_type == "vk":
+                    # Приводим к формату id...
+                    if not str(query_value).startswith("id"):
+                        query_value = f"id{query_value}"
+                
+                try:
+                    response = requests.post(
+                        self.base_url,
+                        json={"api_key": self.api_key, "query": query_value},
+                        headers={"X-API-Key": self.api_key},
+                        timeout=15
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        results.append({
+                            "source": "redmask",
+                            "field": local_param,
+                            "value": params[local_param],
+                            "found": True,
+                            "data": data
+                        })
+                    else:
+                        results.append({
+                            "source": "redmask",
+                            "field": local_param,
+                            "value": params[local_param],
+                            "found": False,
+                            "error": f"HTTP {response.status_code}"
+                        })
+                except Exception as e:
+                    results.append({
+                        "source": "redmask",
+                        "field": local_param,
+                        "value": params[local_param],
+                        "found": False,
+                        "error": str(e)
+                    })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
 # ============================================================================
 # АУТЕНТИФИКАЦИЯ
 # ============================================================================
@@ -1376,7 +1454,8 @@ search_modules = [
     DeepScanModule(),
     BigBaseModule(),
     OnuxModule(),
-    TulasayModule()
+    TulasayModule(),
+    RedMaskModule()
 ]
 
 # ============================================================================
