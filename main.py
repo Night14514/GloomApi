@@ -39,9 +39,9 @@ load_dotenv()
 # ============================================================================
 
 # База данных для продакшена на bot.host.ru
-# PostgreSQL для сохранения ключей между деплоями
-# Стандартные параметры для PostgreSQL на хостинге
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:GloomApi2026SecureDB@localhost:5432/gloomapi")
+# Для сохранения ключей между деплоями используйте внешнюю PostgreSQL или постоянное хранилище
+# На bot.host.ru настройте DATABASE_URL в переменных окружения
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./search.db")
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_TELEGRAM_IDS = [int(x) for x in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if x]
