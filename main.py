@@ -7,10 +7,13 @@ Unified Search API - Простой поиск по данным
 Интеграция всех API из ресурсов
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from collections import defaultdict
+from time import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from pydantic import BaseModel, ConfigDict
@@ -39,6 +42,11 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./search.db")
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_TELEGRAM_IDS = [int(x) for x in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if x]
+MASTER_API_KEY = os.getenv("MASTER_API_KEY", "")
+ADMIN_IP_WHITELIST = [ip.strip() for ip in os.getenv("ADMIN_IP_WHITELIST", "").split(",") if ip.strip()]
+ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "").split(",") if origin.strip()]
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
+RATE_LIMIT_PERIOD = int(os.getenv("RATE_LIMIT_PERIOD", "60"))
 
 # Для PostgreSQL на Railway
 if DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://"):
@@ -49,6 +57,45 @@ else:
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+# ============================================================================
+# RATE LIMITING
+# ============================================================================
+
+class RateLimiter:
+    """Simple in-memory rate limiter"""
+    
+    def __init__(self, requests: int, period: int):
+        self.requests = requests
+        self.period = period
+        self.requests_history = defaultdict(list)
+    
+    def is_allowed(self, identifier: str) -> bool:
+        """Check if request is allowed for given identifier"""
+        now = time()
+        # Clean old requests
+        self.requests_history[identifier] = [
+            timestamp for timestamp in self.requests_history[identifier]
+            if now - timestamp < self.period
+        ]
+        
+        # Check if under limit
+        if len(self.requests_history[identifier]) < self.requests:
+            self.requests_history[identifier].append(now)
+            return True
+        
+        return False
+    
+    def get_remaining(self, identifier: str) -> int:
+        """Get remaining requests for identifier"""
+        now = time()
+        self.requests_history[identifier] = [
+            timestamp for timestamp in self.requests_history[identifier]
+            if now - timestamp < self.period
+        ]
+        return max(0, self.requests - len(self.requests_history[identifier]))
+
+rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_PERIOD)
 
 def get_db():
     db = SessionLocal()
@@ -1178,6 +1225,41 @@ class TulasayModule(BaseSearchModule):
 
 security = HTTPBearer()
 
+def verify_admin_ip(request: Request) -> bool:
+    """Проверка IP адреса для админских операций"""
+    if not ADMIN_IP_WHITELIST:
+        return True  # Если whitelist не настроен, разрешаем все
+    
+    client_ip = request.client.host
+    # Проверка через X-Forwarded-For для проксированных запросов
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip()
+    
+    return client_ip in ADMIN_IP_WHITELIST
+
+def get_master_api_key(credentials: HTTPAuthorizationCredentials = Depends(security), request: Request = None):
+    """Аутентификация для админских операций через MASTER_API_KEY"""
+    if not MASTER_API_KEY:
+        raise HTTPException(
+            status_code=500, 
+            detail="MASTER_API_KEY не настроен в переменных окружения"
+        )
+    
+    token = credentials.credentials
+    
+    if token != MASTER_API_KEY:
+        raise HTTPException(status_code=401, detail="Неверный мастер-ключ")
+    
+    # Проверка IP whitelist
+    if request and not verify_admin_ip(request):
+        raise HTTPException(
+            status_code=403, 
+            detail=f"IP адрес {request.client.host} не в белом списке"
+        )
+    
+    return True
+
 def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db), request: Request = None):
     token = credentials.credentials
     key_hash = hash_key(token)
@@ -1239,11 +1321,46 @@ app = FastAPI(title="GloomApi - Search API", version="2.0", lifespan=lifespan)
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Rate Limiting Middleware
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Apply rate limiting to all requests"""
+    # Get client identifier (IP address)
+    client_ip = request.client.host
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip()
+    
+    # Skip rate limiting for admin endpoints with valid master key
+    if request.url.path.startswith("/key") or request.url.path.startswith("/keys") or request.url.path == "/stats":
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.replace("Bearer ", "")
+            if token == MASTER_API_KEY:
+                return await call_next(request)
+    
+    # Apply rate limiting
+    if not rate_limiter.is_allowed(client_ip):
+        remaining = rate_limiter.get_remaining(client_ip)
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "Rate limit exceeded",
+                "remaining": remaining,
+                "limit": RATE_LIMIT_REQUESTS,
+                "period": RATE_LIMIT_PERIOD
+            }
+        )
+    
+    response = await call_next(request)
+    response.headers["X-RateLimit-Remaining"] = str(rate_limiter.get_remaining(client_ip))
+    return response
 
 # Инициализация всех поисковых модулей
 search_modules = [
@@ -1350,7 +1467,7 @@ def verify_ip_restrictions(api_key: APIKey, client_ip: str) -> bool:
         return True
 
 @app.post("/key")
-async def create_key(request: CreateKeyRequest, db: Session = Depends(get_db)):
+async def create_key(request: CreateKeyRequest, db: Session = Depends(get_db), authenticated: bool = Depends(get_master_api_key)):
     key_value = f"sk_{secrets.token_urlsafe(32)}"
     key_hash = hash_key(key_value)
     expires_at = datetime.utcnow() + timedelta(days=request.days) if request.days else None
@@ -1370,7 +1487,7 @@ async def create_key(request: CreateKeyRequest, db: Session = Depends(get_db)):
     return api_key
 
 @app.get("/keys")
-async def list_keys(db: Session = Depends(get_db)):
+async def list_keys(db: Session = Depends(get_db), authenticated: bool = Depends(get_master_api_key)):
     keys = db.query(APIKey).all()
     # Скрываем реальные ключи в ответе
     result = []
@@ -1391,7 +1508,7 @@ async def list_keys(db: Session = Depends(get_db)):
     return result
 
 @app.get("/key/{key_id}")
-async def get_key(key_id: int, db: Session = Depends(get_db)):
+async def get_key(key_id: int, db: Session = Depends(get_db), authenticated: bool = Depends(get_master_api_key)):
     api_key = db.query(APIKey).filter(APIKey.id == key_id).first()
     if not api_key:
         raise HTTPException(status_code=404, detail="Ключ не найден")
@@ -1411,7 +1528,7 @@ async def get_key(key_id: int, db: Session = Depends(get_db)):
     }
 
 @app.delete("/key/{key_id}")
-async def delete_key(key_id: int, db: Session = Depends(get_db)):
+async def delete_key(key_id: int, db: Session = Depends(get_db), authenticated: bool = Depends(get_master_api_key)):
     api_key = db.query(APIKey).filter(APIKey.id == key_id).first()
     if not api_key:
         raise HTTPException(status_code=404, detail="Ключ не найден")
@@ -1420,7 +1537,7 @@ async def delete_key(key_id: int, db: Session = Depends(get_db)):
     return {"message": "Ключ удален"}
 
 @app.get("/stats")
-async def get_stats(db: Session = Depends(get_db)):
+async def get_stats(db: Session = Depends(get_db), authenticated: bool = Depends(get_master_api_key)):
     total_keys = db.query(APIKey).count()
     active_keys = db.query(APIKey).filter(APIKey.status == "active").count()
     expired_keys = db.query(APIKey).filter(APIKey.status != "active").count()
