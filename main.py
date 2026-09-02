@@ -30,6 +30,8 @@ import random
 import hashlib
 import asyncio
 import threading
+import hmac
+import base64
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -249,6 +251,65 @@ TULASAY_API_TOKEN = "jg_torL_hDxjW-QRI2Gi063d_gOo8iWD8GaKQLC5fmqrBbuXW0K"
 TULASAY_API_URL = "https://tulasay.ru/api/v1"
 REDMASK_API_KEY = "aTKg9SQ7IK42FlT8YL1p3"
 REDMASK_API_URL = "https://postauditory-indigenously-blakely.ngrok-free.dev/v1/search"
+
+# Additional API keys from apii.txt
+IPINFO_API_KEY = "cf2b2febdde638"
+IPSTACK_API_KEY = "34ee8bfa281241bf63658756990bca58"
+NUMVERIFY_API_KEY = "c84bb45a28c15b8c66911354c091106c"
+MAILBOXLAYER_API_KEY = "271c9e7064ea7a43a7d43709817cfba2"
+IPGEOLOCATION_API_KEY = "73d99145d2e948779263360bfeb67ecc"
+IPDATA_API_KEY = "e5d4dded7a01eb1500f4070e735d16c3"
+ABSTRACT_API_KEY = "e5d0f9c86eab454cb5a821679cfe8525"
+IPBASE_API_KEY = "ipb_live_UGYUcjckxwSrtF0dBS9XcSvmTn44AdL0P8ouDgEY"
+BIGDATACLOUD_API_KEY = "bdc_ead54c97234b498c8e0fd13478adeed3"
+CLOUDMERSIVE_API_KEY = "92fb6582-e8d8-43f2-85c9-896a117b9bd9"
+DEEPSEARCH_API_KEY = "IBqXs5SSpanLR6I5YnjRIYTrywsMqtmk"
+SCANCORE_API_KEY = "7399193134:AnWlkE6z"
+KRAMPUS_API_KEY = "KRMP-KDMW-8RJV-ZZV9"
+LEAKOSINT_API_KEY = "7128288325:1AKvhnOZ"
+LEAKOSINT2_API_KEY = "7949201327:7z2O7xWq"
+LEAKCHECK_API_KEY = "49535f49545f5245414c4c595f4150495f4b4559"
+SNUSBASE_KEY = "sbmeovhou6ecsn9fd9wcwnwwvsvwnc"
+SNUSBASE_SECRET = "sby0b7crta98od7efbb8zr70788n2h"
+OFDATA_API_KEY = "KBnpz1CHKNngFXxK"
+VERIPHONE_API_KEY = "D997B34B302B4A06B3AB815312852E51"
+EMAIL_VALID_API_KEY = "0149939faa924e31876d237c634dca33"
+EMAIL_REPUTATION_API_KEY = "3809fec03c2a4d19af09fbedaf54b1fd"
+PROXYCHECK1_API_KEY = "9fcd3e6622f96a780f0908ce414bb16360d3779d8253f484f319e02cc5c25065"
+PROXYCHECK2_API_KEY = "dbbc251dda62fb51321132d79b070d00cad48acec4c660f7f0b313eb09056e9b"
+ABUSEIPDB_API_KEY = "58878ed65228db88eddfda4983bce5d19d425ddf81f427857b3f59f11aecc34f127862a1cc7d4581"
+SMSC_LOGIN = "kirahacker333"
+SMSC_PASSWORD = "Zangar5050"
+HUNTER_API_KEY = "abc123def456ghi789jkl012mno345pqr678"
+DEHASHED_API_KEY = "dh_1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+DEHASHED_EMAIL = "professor_coder@proton.me"
+HIBP_API_KEY = "0123456789abcdef0123456789abcdef"
+WELEAKINFO_API_KEY = "wli_1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+INTELX_API_KEY = "x-intelligence-1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+FUNSTAT_API_KEY = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiIyMDMzMDI5NDc1IiwianRpIjoiODJmMjlmNzQtYmJlMi00ZGUwLWEwZDQtN2EzMDJhMWE5MDViIiwiZXhwIjoxODAxMDA4MzM4fQ.Mba4aX85YAMcaMLfhUBzXtCoNmEujfMe-6sGBbp3kT-T2SiLM_Ho0BBAFAQ8_C6Gz06PH9mAYhfBvlLSjb4oVd1Fm_vmb8MC-wuObU3qgfGrYdGzVF3ntJHv-LdNELq-jsqvQOY3jq9meso9dUoyj5SviDQWL6cvnRQ03kpHWxA"
+SHODAN_API_KEY = "z6kC8mX9pL2qR0sT4uV7wY1zA3bD5eG8hJ0nM3pQ6sT9vW2yZ4cF7iJ1lN4oR7uX0zA3C5"
+CENSYS_ID = "c2a1b3d4-e5f6-7890-abcd-ef1234567890"
+CENSYS_SECRET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"
+BINARYEDGE_API_KEY = "BE-1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+GREYNOISE_API_KEY = "gn-1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+BIGBASE_API_KEYS = "H-OE9Ekx7gfZu1Xbfe0we7TL7btnJzJ_,xMVdL8a-NgJnnwAjGo0bZ-GVOq9o3zBq,OFOdFXXd_S7ojuTp8JJnK_Q_sZESDwzN,MkJm1j8F1AyyhXtzY9fu6JALe1S72owZ,m5JLoYa-jX7W8RY3TnB01O7PBknd3RV7,0nBIi5IDlx-ep9S9bMuw0Fj8g9AcwFT8,kb3S-ijS-NeMHzrsuw4uIY-aJZltJhEp,72UZOG4sadWaXAIJCQYlMmOR82CuSgNd,M9djfI8W3l-ozvCNsxPuLGONicsvgvnM,HTuFdLn37hW6FaiPJeSVtu5iazWKCs-n"
+API_KEY_DEPSEARCH = "bdIUze7ym7OqJ7kd4GHJ3S9wgDOqTDmE"
+BIGBASE_TOKEN = "g-eg8muf-20sQ_ygoovh_jTWacp43rTh"
+INFINITY_SEARCH_API_KEY = "50c14c6dffb8d0b9c210c9a1"
+GLOOMAPI_API_KEY = "sk_U--ls-i6C65058T3xAdT6cOgG-ghNslueJSX8I9y0Zg"
+IPDATA_CO_API_KEY = "c335d87f4e99ce6a747f8628bea61368f7274ff83b39d019c4ed0731"
+SHODAN_API_KEY_ALT = "aytQRnUGbufbvrEoftFAGK5sglpFC6Mi"
+IP2LOCATION_API_KEY = "965108E0429BB3E9329066D8D015564C"
+WHOISJSON_API_KEY = "dbbc251dda62fb51321132d79b070d00cad48acec4c660f7f0b313eb09056e9b"
+FISHAPI_API_KEY = "jTaxIU2GgwuR5RgGcerx"
+LEAKIX_API_KEY = "UbRPZUev61jvVDyIinkjDOzj2r1s8vjmOq58SxbJ0Ona4Gxq"
+BLACKEYE_API_KEY = "jn87axW1a3MSh8x83AJtDg"
+COREAPI_API_KEY = "17aq_xu81(sbaop"
+WHITESEARCH_API_KEY = "WS-PUBLIC-9X7K-2M4P"
+W2SP3R_API_KEY = "Mg05qwg9kfJZgMA1sUshI_-LxS6c33iQWR4JslZRubc"
+QUICKFLOW_TOKEN = "063b6819d85570dfe1b5f5b4ba5be14ac1d66a74e848ee9d1588068a9cf9b372"
+FUNSTAT_TOKEN_ALT = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiI4OTIxNDc4MTAyIiwianRpIjoiOGUxOWIwYzgtNDc5Yi00YmE4LWEwMTYtNjZmOTcxMTQyMGQyIiwiZXhwIjoxODEyMDUyMzc3fQ.tLuq42piT66rfewe0N8Ui37IdsSjbxB8RHPWXIemn3UeuO489wYBSoHeNTKC5SFzif8wACjzwdK8v6GVX80Vj-fhN58d5eV2odONXtgfVXrIVARrpNhoWZ4hKufJ_RqiTfJSjvlO_yEI7G8FBpAG7IZY4YqEUwqDgkGkfkXUYlk"
+GERHANO_API_KEY = "ns-MVzUx4QtfyiQrQ72qTOz2UoZWeiHMa1f"
 
 # ============================================================================
 # ПОИСКОВЫЕ МОДУЛИ ДЛЯ КАЖДОГО API
@@ -1304,6 +1365,1398 @@ class RedMaskModule(BaseSearchModule):
         
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
+class IPInfoModule(BaseSearchModule):
+    """IPInfo API - геолокация и информация об IP"""
+    
+    def __init__(self):
+        self.base_url = "https://ipinfo.io"
+        self.api_key = IPINFO_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("ip"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/{params['ip']}/json",
+                    params={"token": self.api_key},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "ipinfo",
+                        "field": "ip",
+                        "value": params["ip"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "ipinfo",
+                    "field": "ip",
+                    "value": params["ip"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class IPStackModule(BaseSearchModule):
+    """IPStack API - геолокация IP"""
+    
+    def __init__(self):
+        self.base_url = "http://api.ipstack.com"
+        self.api_key = IPSTACK_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("ip"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/{params['ip']}",
+                    params={
+                        "access_key": self.api_key,
+                        "fields": "main,country_code,region_code,city,zip,latitude,longitude,location,continent_code,region_name"
+                    },
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "ipstack",
+                        "field": "ip",
+                        "value": params["ip"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "ipstack",
+                    "field": "ip",
+                    "value": params["ip"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class IPGeolocationModule(BaseSearchModule):
+    """IPGeolocation API - геолокация IP"""
+    
+    def __init__(self):
+        self.base_url = "https://api.ipgeolocation.io"
+        self.api_key = IPGEOLOCATION_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("ip"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/ipgeo",
+                    params={
+                        "apiKey": self.api_key,
+                        "ip": params["ip"],
+                        "fields": "country_code2,country_name,state_prov,city,zipcode,latitude,longitude"
+                    },
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "ipgeolocation",
+                        "field": "ip",
+                        "value": params["ip"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "ipgeolocation",
+                    "field": "ip",
+                    "value": params["ip"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class IPDataModule(BaseSearchModule):
+    """IPData API - информация об IP"""
+    
+    def __init__(self):
+        self.base_url = "https://api.ipdata.co"
+        self.api_key = IPDATA_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("ip"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/{params['ip']}",
+                    params={"api_key": self.api_key},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "ipdata",
+                        "field": "ip",
+                        "value": params["ip"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "ipdata",
+                    "field": "ip",
+                    "value": params["ip"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class IPBaseModule(BaseSearchModule):
+    """IPBase API - геолокация IP"""
+    
+    def __init__(self):
+        self.base_url = "https://api.ipbase.com"
+        self.api_key = IPBASE_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("ip"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/v2/info",
+                    params={"apikey": self.api_key, "ip": params["ip"]},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "ipbase",
+                        "field": "ip",
+                        "value": params["ip"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "ipbase",
+                    "field": "ip",
+                    "value": params["ip"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class IP2LocationModule(BaseSearchModule):
+    """IP2Location API - геолокация IP"""
+    
+    def __init__(self):
+        self.base_url = "https://api.ip2location.io"
+        self.api_key = IP2LOCATION_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("ip"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/",
+                    params={
+                        "key": self.api_key,
+                        "ip": params["ip"],
+                        "format": "json"
+                    },
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "ip2location",
+                        "field": "ip",
+                        "value": params["ip"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "ip2location",
+                    "field": "ip",
+                    "value": params["ip"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class NumVerifyModule(BaseSearchModule):
+    """NumVerify API - валидация телефонных номеров"""
+    
+    def __init__(self):
+        self.base_url = "http://apilayer.net/api"
+        self.api_key = NUMVERIFY_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("phone"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/validate",
+                    params={
+                        "access_key": self.api_key,
+                        "number": params["phone"],
+                        "country_code": "",
+                        "format": 1
+                    },
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "numverify",
+                        "field": "phone",
+                        "value": params["phone"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "numverify",
+                    "field": "phone",
+                    "value": params["phone"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class MailboxlayerModule(BaseSearchModule):
+    """Mailboxlayer API - валидация email"""
+    
+    def __init__(self):
+        self.base_url = "https://apilayer.net/api"
+        self.api_key = MAILBOXLAYER_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("email"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/check",
+                    params={
+                        "access_key": self.api_key,
+                        "email": params["email"],
+                        "smtp": 1,
+                        "format": 1
+                    },
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "mailboxlayer",
+                        "field": "email",
+                        "value": params["email"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "mailboxlayer",
+                    "field": "email",
+                    "value": params["email"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class EmailValidModule(BaseSearchModule):
+    """EmailValid API (APIVerve) - валидация email"""
+    
+    def __init__(self):
+        self.base_url = "https://api.apiverve.com"
+        self.api_key = EMAIL_VALID_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("email"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/v1/emailvalidator",
+                    params={"email": params["email"]},
+                    headers={"x-api-key": self.api_key},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "email_valid",
+                        "field": "email",
+                        "value": params["email"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "email_valid",
+                    "field": "email",
+                    "value": params["email"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class EmailReputationModule(BaseSearchModule):
+    """EmailReputation API (Abstract) - проверка репутации email"""
+    
+    def __init__(self):
+        self.base_url = "https://emailreputation.abstractapi.com"
+        self.api_key = EMAIL_REPUTATION_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("email"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/v1",
+                    params={"api_key": self.api_key, "email": params["email"]},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "email_reputation",
+                        "field": "email",
+                        "value": params["email"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "email_reputation",
+                    "field": "email",
+                    "value": params["email"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class VeriPhoneModule(BaseSearchModule):
+    """VeriPhone API - валидация телефонных номеров"""
+    
+    def __init__(self):
+        self.base_url = "https://api.veriphone.io"
+        self.api_key = VERIPHONE_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("phone"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/v2/verify",
+                    params={"key": self.api_key, "phone": params["phone"]},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "veriphone",
+                        "field": "phone",
+                        "value": params["phone"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "veriphone",
+                    "field": "phone",
+                    "value": params["phone"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class ProxyCheckModule(BaseSearchModule):
+    """ProxyCheck API - проверка IP на прокси/VPN"""
+    
+    def __init__(self):
+        self.base_url = "https://proxycheck.io"
+        self.api_keys = [PROXYCHECK1_API_KEY, PROXYCHECK2_API_KEY]
+        self.current_key_index = 0
+    
+    def get_next_key(self) -> str:
+        key = self.api_keys[self.current_key_index]
+        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+        return key
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("ip"):
+            try:
+                key = self.get_next_key()
+                response = requests.get(
+                    f"{self.base_url}/v2/{params['ip']}",
+                    params={"key": key, "vpn": 1, "asn": 1},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "proxycheck",
+                        "field": "ip",
+                        "value": params["ip"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "proxycheck",
+                    "field": "ip",
+                    "value": params["ip"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class AbuseIPDBModule(BaseSearchModule):
+    """AbuseIPDB API - проверка IP на злоупотребления"""
+    
+    def __init__(self):
+        self.base_url = "https://api.abuseipdb.com/api/v2"
+        self.api_key = ABUSEIPDB_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("ip"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/check",
+                    params={
+                        "ipAddress": params["ip"],
+                        "maxAgeInDays": 90,
+                        "verbose": ""
+                    },
+                    headers={"Key": self.api_key},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "abuseipdb",
+                        "field": "ip",
+                        "value": params["ip"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "abuseipdb",
+                    "field": "ip",
+                    "value": params["ip"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class ShodanModule(BaseSearchModule):
+    """Shodan API - киберразведка по IP"""
+    
+    def __init__(self):
+        self.base_url = "https://api.shodan.io"
+        self.api_key = SHODAN_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("ip"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/shodan/host/{params['ip']}",
+                    params={"key": self.api_key},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "shodan",
+                        "field": "ip",
+                        "value": params["ip"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "shodan",
+                    "field": "ip",
+                    "value": params["ip"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class HunterModule(BaseSearchModule):
+    """Hunter API - поиск email по домену"""
+    
+    def __init__(self):
+        self.base_url = "https://api.hunter.io/v2"
+        self.api_key = HUNTER_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("domain"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/domain-search",
+                    params={"domain": params["domain"], "api_key": self.api_key},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "hunter",
+                        "field": "domain",
+                        "value": params["domain"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "hunter",
+                    "field": "domain",
+                    "value": params["domain"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        if params.get("email"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/email-finder",
+                    params={"domain": params.get("domain", ""), "api_key": self.api_key},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "hunter",
+                        "field": "email",
+                        "value": params["email"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "hunter",
+                    "field": "email",
+                    "value": params["email"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class HIBPModule(BaseSearchModule):
+    """Have I Been Pwned API - проверка утечек данных"""
+    
+    def __init__(self):
+        self.base_url = "https://haveibeenpwned.com/api/v3"
+        self.api_key = HIBP_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("email"):
+            try:
+                import hashlib
+                sha1 = hashlib.sha1(params["email"].lower().encode()).hexdigest().upper()
+                prefix = sha1[:5]
+                suffix = sha1[5:]
+                
+                response = requests.get(
+                    f"{self.base_url}/range/{prefix}",
+                    headers={
+                        "hibp-api-key": self.api_key,
+                        "User-Agent": "GloomAPI"
+                    },
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.text
+                    results.append({
+                        "source": "hibp",
+                        "field": "email",
+                        "value": params["email"],
+                        "found": True,
+                        "data": {"range": data, "suffix": suffix}
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "hibp",
+                    "field": "email",
+                    "value": params["email"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class LeakCheckModule(BaseSearchModule):
+    """LeakCheck API - проверка утечек данных"""
+    
+    def __init__(self):
+        self.base_url = "https://api.leakcheck.io"
+        self.api_key = LEAKCHECK_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        # LeakCheck supports email, phone, ip
+        query = params.get("email") or params.get("phone") or params.get("ip")
+        if query:
+            try:
+                import base64
+                query_type = "email" if params.get("email") else "phone" if params.get("phone") else "ip"
+                query_b64 = base64.b64encode(query.encode()).decode()
+                
+                response = requests.get(
+                    f"{self.base_url}/check/{query_type}/{query_b64}",
+                    headers={"X-API-Key": self.api_key},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "leakcheck",
+                        "field": query_type,
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "leakcheck",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class SnusbaseModule(BaseSearchModule):
+    """Snusbase API - поиск в базах данных"""
+    
+    def __init__(self):
+        self.base_url = "https://api.snusbase.com"
+        self.key = SNUSBASE_KEY
+        self.secret = SNUSBASE_SECRET
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        # Snusbase supports email, username, ip, phone
+        query = params.get("email") or params.get("username") or params.get("ip") or params.get("phone")
+        if query:
+            try:
+                import hmac
+                import hashlib
+                import time
+                
+                timestamp = int(time.time())
+                term_type = "email" if params.get("email") else "username" if params.get("username") else "ip" if params.get("ip") else "phone"
+                
+                signature = hmac.new(
+                    self.secret.encode(),
+                    f"{self.key}{timestamp}{term_type}{query}".encode(),
+                    hashlib.sha256
+                ).hexdigest()
+                
+                response = requests.get(
+                    f"{self.base_url}/search",
+                    params={
+                        "key": self.key,
+                        "type": term_type,
+                        "term": query,
+                        "timestamp": timestamp,
+                        "signature": signature
+                    },
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "snusbase",
+                        "field": term_type,
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "snusbase",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class DehashedModule(BaseSearchModule):
+    """Dehashed API - поиск в утекших базах"""
+    
+    def __init__(self):
+        self.base_url = "https://api.dehashed.com"
+        self.api_key = DEHASHED_API_KEY
+        self.email = DEHASHED_EMAIL
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        # Dehashed supports email, username, ip, phone, name
+        query = params.get("email") or params.get("username") or params.get("ip") or params.get("phone") or params.get("name")
+        if query:
+            try:
+                import base64
+                auth_str = f"{self.email}:{self.api_key}"
+                auth_b64 = base64.b64encode(auth_str.encode()).decode()
+                
+                search_type = "email" if params.get("email") else "username" if params.get("username") else "ip" if params.get("ip") else "phone" if params.get("phone") else "name"
+                
+                response = requests.get(
+                    f"{self.base_url}/search",
+                    params={"query": f"{search_type}:{query}"},
+                    headers={"Authorization": f"Basic {auth_b64}"},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "dehashed",
+                        "field": search_type,
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "dehashed",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class WeLeakInfoModule(BaseSearchModule):
+    """WeLeakInfo API - поиск утечек данных"""
+    
+    def __init__(self):
+        self.base_url = "https://api.weleakinfo.com"
+        self.api_key = WELEAKINFO_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        query = params.get("email") or params.get("username") or params.get("phone")
+        if query:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/v3/search",
+                    params={"key": self.api_key, "query": query},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "weleakinfo",
+                        "field": "query",
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "weleakinfo",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class CensysModule(BaseSearchModule):
+    """Censys API - киберразведка по IP"""
+    
+    def __init__(self):
+        self.base_url = "https://search.censys.io"
+        self.api_id = CENSYS_ID
+        self.api_secret = CENSYS_SECRET
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("ip"):
+            try:
+                import base64
+                auth_str = f"{self.api_id}:{self.api_secret}"
+                auth_b64 = base64.b64encode(auth_str.encode()).decode()
+                
+                response = requests.get(
+                    f"{self.base_url}/api/v2/hosts/{params['ip']}",
+                    headers={"Authorization": f"Basic {auth_b64}"},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "censys",
+                        "field": "ip",
+                        "value": params["ip"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "censys",
+                    "field": "ip",
+                    "value": params["ip"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class BinaryEdgeModule(BaseSearchModule):
+    """BinaryEdge API - киберразведка по IP"""
+    
+    def __init__(self):
+        self.base_url = "https://api.binaryedge.io"
+        self.api_key = BINARYEDGE_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("ip"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/v2/query/ip/{params['ip']}",
+                    headers={"X-Key": self.api_key},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "binaryedge",
+                        "field": "ip",
+                        "value": params["ip"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "binaryedge",
+                    "field": "ip",
+                    "value": params["ip"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class GreyNoiseModule(BaseSearchModule):
+    """GreyNoise API - проверка IP на шум"""
+    
+    def __init__(self):
+        self.base_url = "https://api.greynoise.io"
+        self.api_key = GREYNOISE_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        if params.get("ip"):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/v3/community/{params['ip']}",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "greynoise",
+                        "field": "ip",
+                        "value": params["ip"],
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "greynoise",
+                    "field": "ip",
+                    "value": params["ip"],
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class IntelXModule(BaseSearchModule):
+    """IntelX API - поиск в утечках данных"""
+    
+    def __init__(self):
+        self.base_url = "https://public.intelx.io"
+        self.api_key = INTELX_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        query = params.get("email") or params.get("phone") or params.get("ip") or params.get("username")
+        if query:
+            try:
+                # First, initiate search
+                search_response = requests.post(
+                    f"{self.base_url}/phonebook/search",
+                    headers={"x-key": self.api_key},
+                    json={"term": query, "maxresults": 100, "media": 0},
+                    timeout=10
+                )
+                if search_response.status_code == 200:
+                    search_data = search_response.json()
+                    if search_data.get("id"):
+                        # Then get results
+                        results_response = requests.get(
+                            f"{self.base_url}/phonebook/search/result/{search_data['id']}",
+                            headers={"x-key": self.api_key},
+                            timeout=10
+                        )
+                        if results_response.status_code == 200:
+                            results_data = results_response.json()
+                            results.append({
+                                "source": "intelx",
+                                "field": "query",
+                                "value": query,
+                                "found": True,
+                                "data": results_data
+                            })
+            except Exception as e:
+                results.append({
+                    "source": "intelx",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class OFDataModule(BaseSearchModule):
+    """OFData API - поиск по российским данным"""
+    
+    def __init__(self):
+        self.base_url = "https://ofdata.ru"
+        self.api_key = OFDATA_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        # OFData supports INN, OGRN, phone
+        query = params.get("inn") or params.get("phone")
+        if query:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/api/v1/search",
+                    params={"key": self.api_key, "query": query},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "ofdata",
+                        "field": "query",
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "ofdata",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class FishAPIModule(BaseSearchModule):
+    """FishAPI - универсальный поиск"""
+    
+    def __init__(self):
+        self.base_url = "https://fish-api--fishapi.replit.app"
+        self.api_key = FISHAPI_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        query = params.get("phone") or params.get("email") or params.get("username") or params.get("ip")
+        if query:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/api/v1/search",
+                    params={"key": self.api_key, "query": query},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "fishapi",
+                        "field": "query",
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "fishapi",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class LeakIXModule(BaseSearchModule):
+    """LeakIX API - поиск утечек данных"""
+    
+    def __init__(self):
+        self.base_url = "https://leakix.net"
+        self.api_key = LEAKIX_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        query = params.get("email") or params.get("phone") or params.get("ip") or params.get("domain")
+        if query:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/api/search",
+                    params={"key": self.api_key, "query": query},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "leakix",
+                        "field": "query",
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "leakix",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class BlackEyeModule(BaseSearchModule):
+    """BlackEye API - универсальный поиск"""
+    
+    def __init__(self):
+        self.base_url = "https://blackeyebot.duckdns.org"
+        self.api_key = BLACKEYE_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        query = params.get("phone") or params.get("email") or params.get("username") or params.get("ip")
+        if query:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/api/v1/search",
+                    params={"key": self.api_key, "query": query},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "blackeye",
+                        "field": "query",
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "blackeye",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class CoreAPIModule(BaseSearchModule):
+    """CoreAPI - универсальный поиск"""
+    
+    def __init__(self):
+        self.base_url = "http://2.26.230.220:8081"
+        self.api_key = COREAPI_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        query = params.get("phone") or params.get("email") or params.get("username") or params.get("ip")
+        if query:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/search",
+                    params={"key": self.api_key, "query": query},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "coreapi",
+                        "field": "query",
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "coreapi",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class WhiteSearchModule(BaseSearchModule):
+    """WhiteSearch API - универсальный поиск"""
+    
+    def __init__(self):
+        self.base_url = "https://api.whitesearch.workers.dev"
+        self.api_key = WHITESEARCH_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        query = params.get("phone") or params.get("email") or params.get("username") or params.get("ip")
+        if query:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/api/search",
+                    params={"key": self.api_key, "query": query},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "whitesearch",
+                        "field": "query",
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "whitesearch",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class W2SP3RModule(BaseSearchModule):
+    """W2SP3R API - универсальный поиск"""
+    
+    def __init__(self):
+        self.base_url = "https://api.w2sp3r.biz"
+        self.api_key = W2SP3R_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        query = params.get("phone") or params.get("email") or params.get("username") or params.get("ip")
+        if query:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/nyx",
+                    params={"key": self.api_key, "query": query},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "w2sp3r",
+                        "field": "query",
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "w2sp3r",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class QuickFlowModule(BaseSearchModule):
+    """QuickFlow API - универсальный поиск"""
+    
+    def __init__(self):
+        self.base_url = "https://api.quickflow.lat"
+        self.api_key = QUICKFLOW_TOKEN
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        query = params.get("phone") or params.get("email") or params.get("username") or params.get("ip")
+        if query:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/search",
+                    params={"token": self.api_key, "query": query},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "quickflow",
+                        "field": "query",
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "quickflow",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class FunStatModule(BaseSearchModule):
+    """FunStat API - поиск статистики"""
+    
+    def __init__(self):
+        self.base_url = "https://api.funstat.cc"
+        self.api_key = FUNSTAT_TOKEN_ALT
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        query = params.get("phone") or params.get("email") or params.get("username") or params.get("ip")
+        if query:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/search",
+                    params={"token": self.api_key, "query": query},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "funstat",
+                        "field": "query",
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "funstat",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+class GerhanoModule(BaseSearchModule):
+    """Gerhano API - универсальный поиск"""
+    
+    def __init__(self):
+        self.base_url = "https://netspyapi.netlify.app"
+        self.api_key = GERHANO_API_KEY
+    
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        
+        query = params.get("phone") or params.get("email") or params.get("username") or params.get("ip")
+        if query:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/search",
+                    params={"key": self.api_key, "query": query},
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    results.append({
+                        "source": "gerhano",
+                        "field": "query",
+                        "value": query,
+                        "found": True,
+                        "data": data
+                    })
+            except Exception as e:
+                results.append({
+                    "source": "gerhano",
+                    "field": "query",
+                    "value": query,
+                    "found": False,
+                    "error": str(e)
+                })
+        
+        return {"success": len(results) > 0, "results": results, "total": len(results)}
+
 # ============================================================================
 # АУТЕНТИФИКАЦИЯ
 # ============================================================================
@@ -1462,7 +2915,41 @@ search_modules = [
     BigBaseModule(),
     OnuxModule(),
     TulasayModule(),
-    RedMaskModule()
+    RedMaskModule(),
+    IPInfoModule(),
+    IPStackModule(),
+    IPGeolocationModule(),
+    IPDataModule(),
+    IPBaseModule(),
+    IP2LocationModule(),
+    NumVerifyModule(),
+    MailboxlayerModule(),
+    EmailValidModule(),
+    EmailReputationModule(),
+    VeriPhoneModule(),
+    ProxyCheckModule(),
+    AbuseIPDBModule(),
+    ShodanModule(),
+    HunterModule(),
+    HIBPModule(),
+    LeakCheckModule(),
+    SnusbaseModule(),
+    DehashedModule(),
+    WeLeakInfoModule(),
+    CensysModule(),
+    BinaryEdgeModule(),
+    GreyNoiseModule(),
+    IntelXModule(),
+    OFDataModule(),
+    FishAPIModule(),
+    LeakIXModule(),
+    BlackEyeModule(),
+    CoreAPIModule(),
+    WhiteSearchModule(),
+    W2SP3RModule(),
+    QuickFlowModule(),
+    FunStatModule(),
+    GerhanoModule()
 ]
 
 # ============================================================================
