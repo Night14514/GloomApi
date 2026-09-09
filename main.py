@@ -16,15 +16,21 @@ from collections import defaultdict
 from time import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, ForeignKey
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, ForeignKey, update
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from sqlalchemy.sql import func
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple, Callable, Annotated
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 import secrets
 import json
 import os
+import re
+import logging
+import urllib.parse
 import requests
 import random
 import hashlib
@@ -34,7 +40,16 @@ import hmac
 import base64
 from dotenv import load_dotenv
 
+try:
+    from bs4 import BeautifulSoup
+except ImportError:  # pragma: no cover
+    BeautifulSoup = None
+
 load_dotenv()
+
+logger = logging.getLogger("gloomapi")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 # ============================================================================
 # НАСТРОЙКИ
@@ -56,13 +71,47 @@ ADMIN_IP_WHITELIST = [ip.strip() for ip in os.getenv("ADMIN_IP_WHITELIST", "").s
 ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "").split(",") if origin.strip()]
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
 RATE_LIMIT_PERIOD = int(os.getenv("RATE_LIMIT_PERIOD", "60"))
+TRUST_PROXY = os.getenv("TRUST_PROXY", "0") == "1"
+MAX_QUERY_VALUE_LEN = int(os.getenv("MAX_QUERY_VALUE_LEN", "500"))
+MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "500"))
+OUTPUT_DIR = os.getenv(
+    "OUTPUT_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs"),
+)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Для PostgreSQL на Railway
 if DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://"):
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=10,
+        pool_recycle=1800,
+    )
 else:
-    # Для локального SQLite
-    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+    # SQLite: timeout снижает "database is locked"
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+
+
+def _configure_sqlite(dbapi_conn, connection_record):
+    try:
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+    except Exception:
+        pass
+
+
+if DATABASE_URL.startswith("sqlite"):
+    from sqlalchemy import event as _sa_event
+    _sa_event.listen(engine, "connect", _configure_sqlite)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -72,37 +121,49 @@ Base = declarative_base()
 # ============================================================================
 
 class RateLimiter:
-    """Simple in-memory rate limiter"""
-    
+    """Thread-safe in-memory sliding-window rate limiter with periodic GC."""
+
     def __init__(self, requests: int, period: int):
-        self.requests = requests
-        self.period = period
-        self.requests_history = defaultdict(list)
-    
+        self.requests = max(1, int(requests))
+        self.period = max(1, int(period))
+        self.requests_history: Dict[str, List[float]] = defaultdict(list)
+        self._lock = threading.Lock()
+        self._last_gc = time()
+
+    def _prune(self, identifier: str, now: float) -> None:
+        hist = self.requests_history.get(identifier) or []
+        hist = [ts for ts in hist if now - ts < self.period]
+        if hist:
+            self.requests_history[identifier] = hist
+        else:
+            self.requests_history.pop(identifier, None)
+
+    def _gc(self, now: float) -> None:
+        if now - self._last_gc < max(30.0, float(self.period)):
+            return
+        stale = [k for k, v in self.requests_history.items() if not v or now - v[-1] >= self.period]
+        for k in stale:
+            self.requests_history.pop(k, None)
+        self._last_gc = now
+
     def is_allowed(self, identifier: str) -> bool:
-        """Check if request is allowed for given identifier"""
+        identifier = (identifier or "unknown")[:128]
         now = time()
-        # Clean old requests
-        self.requests_history[identifier] = [
-            timestamp for timestamp in self.requests_history[identifier]
-            if now - timestamp < self.period
-        ]
-        
-        # Check if under limit
-        if len(self.requests_history[identifier]) < self.requests:
-            self.requests_history[identifier].append(now)
-            return True
-        
-        return False
-    
+        with self._lock:
+            self._gc(now)
+            self._prune(identifier, now)
+            hist = self.requests_history[identifier]
+            if len(hist) < self.requests:
+                hist.append(now)
+                return True
+            return False
+
     def get_remaining(self, identifier: str) -> int:
-        """Get remaining requests for identifier"""
+        identifier = (identifier or "unknown")[:128]
         now = time()
-        self.requests_history[identifier] = [
-            timestamp for timestamp in self.requests_history[identifier]
-            if now - timestamp < self.period
-        ]
-        return max(0, self.requests - len(self.requests_history[identifier]))
+        with self._lock:
+            self._prune(identifier, now)
+            return max(0, self.requests - len(self.requests_history.get(identifier, [])))
 
 rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_PERIOD)
 
@@ -163,40 +224,94 @@ def init_db():
 # ============================================================================
 
 class SearchRequest(BaseModel):
-    phone: Optional[str] = None
-    email: Optional[str] = None
-    nick: Optional[str] = None
-    username: Optional[str] = None
-    name: Optional[str] = None
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    fio: Optional[str] = None
-    fullname: Optional[str] = None
-    passport: Optional[str] = None
-    inn: Optional[str] = None
-    snils: Optional[str] = None
-    vin: Optional[str] = None
-    car_number: Optional[str] = None
-    ip: Optional[str] = None
-    telegram: Optional[str] = None
-    telegram_id: Optional[str] = None
-    vk: Optional[str] = None
-    vk_id: Optional[str] = None
-    card: Optional[str] = None
-    imei: Optional[str] = None
-    address: Optional[str] = None
-    social: Optional[str] = None
-    number: Optional[str] = None
-    bdate: Optional[str] = None
-    domain: Optional[str] = None
-    photo_url: Optional[str] = None
-    output_file: Optional[str] = None
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    phone: Optional[str] = Field(None, max_length=64)
+    email: Optional[str] = Field(None, max_length=320)
+    nick: Optional[str] = Field(None, max_length=128)
+    username: Optional[str] = Field(None, max_length=128)
+    name: Optional[str] = Field(None, max_length=256)
+    first_name: Optional[str] = Field(None, max_length=128)
+    last_name: Optional[str] = Field(None, max_length=128)
+    fio: Optional[str] = Field(None, max_length=256)
+    fullname: Optional[str] = Field(None, max_length=256)
+    passport: Optional[str] = Field(None, max_length=64)
+    inn: Optional[str] = Field(None, max_length=32)
+    snils: Optional[str] = Field(None, max_length=32)
+    vin: Optional[str] = Field(None, max_length=32)
+    car_number: Optional[str] = Field(None, max_length=32)
+    ip: Optional[str] = Field(None, max_length=64)
+    telegram: Optional[str] = Field(None, max_length=128)
+    telegram_id: Optional[str] = Field(None, max_length=64)
+    vk: Optional[str] = Field(None, max_length=256)
+    vk_id: Optional[str] = Field(None, max_length=64)
+    card: Optional[str] = Field(None, max_length=32)
+    imei: Optional[str] = Field(None, max_length=32)
+    address: Optional[str] = Field(None, max_length=500)
+    social: Optional[str] = Field(None, max_length=256)
+    number: Optional[str] = Field(None, max_length=64)
+    bdate: Optional[str] = Field(None, max_length=32)
+    domain: Optional[str] = Field(None, max_length=253)
+    photo_url: Optional[str] = Field(None, max_length=2048)
+    password: Optional[str] = Field(None, max_length=256)
+    output_file: Optional[str] = Field(None, max_length=255)
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _empty_to_none(cls, v):
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    @field_validator("email")
+    @classmethod
+    def _email_basic(cls, v):
+        if v is None:
+            return v
+        if "@" not in v or len(v) < 3:
+            raise ValueError("Некорректный email")
+        return v
+
+    @field_validator("ip")
+    @classmethod
+    def _ip_basic(cls, v):
+        if v is None:
+            return v
+        # допускаем IPv4 / IPv6 без жёсткого парсера
+        if not re.match(r"^[0-9a-fA-F:.]+$", v) or len(v) < 3:
+            raise ValueError("Некорректный IP")
+        return v
+
+    @field_validator("photo_url")
+    @classmethod
+    def _photo_url(cls, v):
+        if v is None:
+            return v
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError("photo_url должен начинаться с http(s)://")
+        return v
+
 
 class CreateKeyRequest(BaseModel):
-    name: str
-    days: Optional[int] = None
-    limit: Optional[int] = None
-    ip_restrictions: Optional[List[str]] = None
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=255)
+    days: Optional[int] = Field(None, ge=1, le=3650)
+    limit: Optional[int] = Field(None, ge=1, le=10_000_000)
+    ip_restrictions: Optional[List[str]] = Field(None, max_length=64)
+
+    @field_validator("ip_restrictions")
+    @classmethod
+    def _ips(cls, v):
+        if v is None:
+            return v
+        cleaned = []
+        for ip in v:
+            ip = str(ip).strip()
+            if not ip or len(ip) > 64:
+                raise ValueError("Некорректный IP в ip_restrictions")
+            cleaned.append(ip)
+        return cleaned
 
 class KeyStatsResponse(BaseModel):
     total_keys: int
@@ -234,9 +349,19 @@ TELEGRAM_HISTORY_TOKEN = "124:Bpx2NjYkqfE9hnkgYNm0_c84tFmACk3D"
 RAIDFIND_API_KEY = "rf_live_e7285c81c1334de11b211dbda0f81b1e9729c81ecb7589f0"
 VK_TOKEN = "0af157510af157510af15751aa0a89e69600af10af157516a0bc15996e74fe2b440998c"
 VK_API_VERSION = "5.199"
-TRUECALLER_INSTALLATION_ID = "a1i2N--Ql8rEHHVAS8AVeQ"
-INFINITY_SEARCH_TOKEN = "Bjm928HUcvsw923ZMBX19gd110FWSZgd"
-INFINITY_SEARCH_URL = "https://infinity-search.fun"
+TRUECALLER_INSTALLATION_ID = os.getenv("TRUECALLER_INSTALLATION_ID", "a1i2N--Ql8rEHHVAS8AVeQ")
+INFINITY_SEARCH_TOKEN = os.getenv("INFINITY_SEARCH_TOKEN", "QoNm98UeMLIqNjZ198snm98AdGvhqA88")
+INFINITY_SEARCH_URL = os.getenv("INFINITY_SEARCH_URL", "https://infinity-search.fun/find.php")
+INFINITY_SEARCH_TOKEN_ALT = "Bjm928HUcvsw923ZMBX19gd110FWSZgd"
+DEPSEARCH_BASE_URL = os.getenv("DEPSEARCH_BASE_URL", "https://depsearch.sbs")
+PANSRC_TOKEN = os.getenv("PANSRC_TOKEN", "pant_g3U5TEfe7r1zg4i30vuAkEJyTEisOXiw")
+PANSRC_URL = os.getenv("PANSRC_URL", "http://pantsrc.p7z.ru/search")
+LEAK_LOOKUP_SESSION = os.getenv("LEAK_LOOKUP_SESSION", "gc4hn4q6oal49gq0ckv4ujnabs")
+SEON_API_KEY = os.getenv("SEON_API_KEY", "758f5f54-befb-4125-bd17-931689af6633")
+WHATSAPP_EMAIL = os.getenv("WHATSAPP_EMAIL", "legislativepaola@web-library.net")
+WHATSAPP_PASSWORD = os.getenv("WHATSAPP_PASSWORD", "legislativepaola@web-library.net")
+SEARCH_TIMEOUT_SEC = int(os.getenv("SEARCH_TIMEOUT_SEC", "90"))
+SEARCH_MAX_WORKERS = int(os.getenv("SEARCH_MAX_WORKERS", "24"))
 
 # New API keys
 DEEPSCAN_KEYS = [
@@ -347,118 +472,297 @@ class APIKeyLoadBalancer:
 # Initialize load balancers for multi-key APIs
 jitler_load_balancer = APIKeyLoadBalancer(JITLER_KEYS)
 deepscan_load_balancer = APIKeyLoadBalancer(DEEPSCAN_KEYS)
+SEARCH_EXECUTOR = ThreadPoolExecutor(max_workers=SEARCH_MAX_WORKERS, thread_name_prefix="gloom-search")
+
+# ============================================================================
+# УТИЛИТЫ НОРМАЛИЗАЦИИ
+# ============================================================================
+
+def normalize_phone(phone: str) -> str:
+    """Нормализация телефона к виду 7XXXXXXXXXX (без +)."""
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if not digits:
+        return ""
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    elif len(digits) == 10 and digits.startswith("9"):
+        digits = "7" + digits
+    return digits
+
+
+def normalize_phone_e164(phone: str) -> str:
+    digits = normalize_phone(phone)
+    return f"+{digits}" if digits else ""
+
+
+def normalize_telegram_query(query: str) -> str:
+    q = (query or "").strip()
+    if q.startswith("@"):
+        return q
+    if q.isdigit():
+        return q
+    return q.lstrip("@")
+
+
+def extract_vk_id(vk_id: str) -> str:
+    vk_id = str(vk_id or "").strip()
+    id_match = re.search(r"(?:^|\b)id[\s:_-]*(\d+)", vk_id, re.I)
+    if id_match:
+        return id_match.group(1)
+    if "vk.com/" in vk_id.lower():
+        match = re.search(r"vk\.com/(?:id)?(\d+)", vk_id, re.I)
+        if match:
+            return match.group(1)
+        match = re.search(r"vk\.com/([a-zA-Z0-9_\.]+)", vk_id, re.I)
+        if match:
+            return match.group(1)
+    if vk_id.isdigit():
+        return vk_id
+    return vk_id
+
+
+def _result_ok(source: str, field: str, value: Any, data: Any, **extra) -> Dict[str, Any]:
+    item = {
+        "source": source,
+        "field": field,
+        "value": value,
+        "found": True,
+        "data": data,
+    }
+    item.update(extra)
+    return item
+
+
+def _result_err(source: str, field: str, value: Any, error: Any) -> Dict[str, Any]:
+    return {
+        "source": source,
+        "field": field,
+        "value": value,
+        "found": False,
+        "error": str(error),
+    }
+
+
+class CircuitBreaker:
+    """Автопропуск мёртвых API после серии ошибок (DNS/timeout/5xx)."""
+
+    def __init__(self, fail_threshold: int = 3, cooldown_sec: int = 300):
+        self.fail_threshold = fail_threshold
+        self.cooldown_sec = cooldown_sec
+        self._failures: Dict[str, int] = defaultdict(int)
+        self._open_until: Dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, name: str) -> bool:
+        with self._lock:
+            until = self._open_until.get(name)
+            if until is None:
+                return True
+            if time() >= until:
+                self._open_until.pop(name, None)
+                self._failures[name] = 0
+                return True
+            return False
+
+    def success(self, name: str) -> None:
+        with self._lock:
+            self._failures[name] = 0
+            self._open_until.pop(name, None)
+
+    def failure(self, name: str, hard: bool = False) -> None:
+        with self._lock:
+            self._failures[name] = self._failures.get(name, 0) + (self.fail_threshold if hard else 1)
+            if self._failures[name] >= self.fail_threshold:
+                self._open_until[name] = time() + self.cooldown_sec
+                logger.warning("Circuit OPEN for %s (cooldown %ss)", name, self.cooldown_sec)
+
+
+circuit_breaker = CircuitBreaker()
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.headers.update({
+    "User-Agent": "GloomApi/2.1",
+    "Accept": "application/json, text/plain, */*",
+})
+_http_retry = Retry(
+    total=1,
+    connect=1,
+    read=0,
+    status=0,
+    backoff_factor=0.2,
+    allowed_methods=frozenset(["GET", "HEAD"]),
+    raise_on_status=False,
+)
+_http_adapter = HTTPAdapter(pool_connections=32, pool_maxsize=64, max_retries=_http_retry)
+HTTP_SESSION.mount("https://", _http_adapter)
+HTTP_SESSION.mount("http://", _http_adapter)
+
+
+def http_request(
+    method: str,
+    url: str,
+    *,
+    module: str = "http",
+    timeout: float = 12,
+    **kwargs,
+) -> Tuple[Optional[requests.Response], Optional[str]]:
+    """Единый HTTP-вызов: circuit breaker + мягкие ошибки без падения поиска."""
+    if not circuit_breaker.allow(module):
+        return None, f"circuit_open:{module}"
+    try:
+        response = HTTP_SESSION.request(method.upper(), url, timeout=timeout, **kwargs)
+        # 401/402/403 — ключ/доступ; не открываем circuit (это не downtime хоста)
+        if response.status_code >= 500:
+            circuit_breaker.failure(module)
+            return response, f"HTTP {response.status_code}"
+        if response.status_code == 429:
+            circuit_breaker.failure(module)
+            return response, "rate_limited"
+        circuit_breaker.success(module)
+        return response, None
+    except requests.exceptions.Timeout:
+        circuit_breaker.failure(module)
+        return None, "timeout"
+    except requests.exceptions.ConnectionError as exc:
+        circuit_breaker.failure(module, hard=True)
+        return None, f"connection_error:{exc}"
+    except Exception as exc:
+        circuit_breaker.failure(module)
+        return None, str(exc)
+
 
 class BaseSearchModule:
     """Базовый класс для поисковых модулей"""
-    
+
+    # Пустой список = модуль сам решает; иначе быстрый skip по полям запроса
+    SUPPORTED_FIELDS: List[str] = []
+    ENABLED: bool = True
+    TIMEOUT: float = 12.0
+    SOURCE_NAME: str = "module"
+
+    def can_handle(self, params: Dict[str, Any]) -> bool:
+        if not self.ENABLED:
+            return False
+        name = self.__class__.__name__
+        if not circuit_breaker.allow(name):
+            return False
+        if not self.SUPPORTED_FIELDS:
+            return True
+        return any(params.get(field) for field in self.SUPPORTED_FIELDS)
+
+    def _get(self, url: str, **kwargs) -> Tuple[Optional[requests.Response], Optional[str]]:
+        kwargs.setdefault("timeout", self.TIMEOUT)
+        return http_request("GET", url, module=self.__class__.__name__, **kwargs)
+
+    def _post(self, url: str, **kwargs) -> Tuple[Optional[requests.Response], Optional[str]]:
+        kwargs.setdefault("timeout", self.TIMEOUT)
+        return http_request("POST", url, module=self.__class__.__name__, **kwargs)
+
     def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Базовый метод поиска"""
         return {"success": False, "error": "Not implemented", "results": []}
 
 class JitlerSearchModule(BaseSearchModule):
-    """Jitler API - поиск по номеру, VK, Telegram"""
-    
+    """Jitler API - расширенный поиск (phone/email/fio/vk/tg/ip/docs/...)"""
+
+    SUPPORTED_FIELDS = [
+        "phone", "number", "email", "nick", "username", "name", "fio", "fullname",
+        "vk", "vk_id", "telegram", "telegram_id", "ip", "passport", "inn", "snils",
+        "vin", "car_number", "card", "imei", "address",
+    ]
+    TIMEOUT = 12.0
+
+    TYPE_MAP = {
+        "phone": ("number", "phone"),
+        "number": ("number", "phone"),
+        "email": ("email",),
+        "nick": ("nick",),
+        "username": ("nick",),
+        "name": ("name",),
+        "fio": ("name",),
+        "fullname": ("name",),
+        "vk": ("vk",),
+        "vk_id": ("vk",),
+        "telegram": ("telegram",),
+        "telegram_id": ("telegram",),
+        "ip": ("ip",),
+        "passport": ("passport",),
+        "inn": ("inn",),
+        "snils": ("snils",),
+        "vin": ("vin",),
+        "car_number": ("car_number",),
+        "card": ("card",),
+        "imei": ("imei",),
+        "address": ("address",),
+    }
+
     def __init__(self):
         self.base_url = "https://api.jitler.top"
         self.load_balancer = jitler_load_balancer
-    
+
+    def _request(self, search_type: str, query: str) -> Tuple[Optional[dict], Optional[str], Optional[str]]:
+        keys = list(self.load_balancer.keys) if self.load_balancer.keys else []
+        last_error = None
+        for _ in range(max(1, len(keys))):
+            key = self.load_balancer.get_next_key() if keys else ""
+            try:
+                response = requests.post(
+                    f"{self.base_url}/search",
+                    json={"type": search_type, "query": query},
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    timeout=self.TIMEOUT,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    payload = data.get("response") if isinstance(data, dict) else None
+                    payload_failed = isinstance(payload, dict) and (
+                        payload.get("error") or payload.get("success") is False
+                    )
+                    if payload not in (None, "", [], {}) and not payload_failed:
+                        return data, key, None
+                    if isinstance(data, dict) and data and "error" not in data:
+                        return data, key, None
+                last_error = f"HTTP {response.status_code}"
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+        return None, None, last_error or "Все ключи Jitler не работают"
+
     def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
         results = []
-        
-        # Поиск по номеру телефона
-        if params.get("phone"):
-            try:
-                key = self.load_balancer.get_next_key()
-                response = requests.post(
-                    f"{self.base_url}/search",
-                    json={"type": "number", "query": params["phone"]},
-                    headers={"Authorization": f"Bearer {key}"},
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results.append({
-                        "source": "jitler",
-                        "field": "phone",
-                        "value": params["phone"],
-                        "found": True,
-                        "data": data,
-                        "api_key": key[:8] + "..."  # Track which key was used
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "jitler",
-                    "field": "phone",
-                    "value": params["phone"],
-                    "found": False,
-                    "error": str(e)
-                })
-        
-        # Поиск по VK
-        if params.get("vk") or params.get("vk_id"):
-            vk_id = params.get("vk") or params.get("vk_id")
-            try:
-                key = self.load_balancer.get_next_key()
-                response = requests.post(
-                    f"{self.base_url}/search",
-                    json={"type": "vk", "query": vk_id},
-                    headers={"Authorization": f"Bearer {key}"},
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results.append({
-                        "source": "jitler",
-                        "field": "vk",
-                        "value": vk_id,
-                        "found": True,
-                        "data": data,
-                        "api_key": key[:8] + "..."  # Track which key was used
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "jitler",
-                    "field": "vk",
-                    "value": vk_id,
-                    "found": False,
-                    "error": str(e)
-                })
-        
-        # Поиск по Telegram
-        if params.get("telegram") or params.get("telegram_id"):
-            tg = params.get("telegram") or params.get("telegram_id")
-            try:
-                key = self.load_balancer.get_next_key()
-                response = requests.post(
-                    f"{self.base_url}/search",
-                    json={"type": "telegram", "query": tg},
-                    headers={"Authorization": f"Bearer {key}"},
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results.append({
-                        "source": "jitler",
-                        "field": "telegram",
-                        "value": tg,
-                        "found": True,
-                        "data": data,
-                        "api_key": key[:8] + "..."  # Track which key was used
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "jitler",
-                    "field": "telegram",
-                    "value": tg,
-                    "found": False,
-                    "error": str(e)
-                })
-        
-        return {"success": len(results) > 0, "results": results, "total": len(results)}
+        tried = set()
+
+        for field, types in self.TYPE_MAP.items():
+            value = params.get(field)
+            if not value:
+                continue
+            query = normalize_phone(value) if field in ("phone", "number") else str(value).strip()
+            if not query:
+                continue
+            for search_type in types:
+                cache_key = (search_type, query)
+                if cache_key in tried:
+                    continue
+                tried.add(cache_key)
+                data, key, error = self._request(search_type, query)
+                if data is not None:
+                    results.append(_result_ok(
+                        "jitler", field, value, data,
+                        api_key=(key[:8] + "...") if key else None,
+                        method=search_type,
+                    ))
+                    break
+                if error and search_type == types[-1]:
+                    results.append(_result_err("jitler", field, value, error))
+
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
 
 class NightSearchModule(BaseSearchModule):
     """NightSearch API - поиск по phone, email, nick, name, fio, inn, SNILS"""
-    
+
+    # Ключ/контракт API сейчас невалидны (400 Missing required fields or API key)
+    ENABLED = False
+    SUPPORTED_FIELDS = ["phone", "email", "nick", "username", "name", "fio", "fullname", "inn", "snils"]
+
     def __init__(self):
         self.base_url = "https://nightsearch.life/api/search"
         self.api_key = NIGHTSEARCH_API_KEY
@@ -471,6 +775,7 @@ class NightSearchModule(BaseSearchModule):
             "phone": "phone",
             "email": "email",
             "nick": "nick",
+            "username": "nick",
             "name": "name",
             "fio": "fio",
             "fullname": "fio",
@@ -478,95 +783,150 @@ class NightSearchModule(BaseSearchModule):
             "snils": "SNILS"
         }
         
+        seen = set()
         for local_param, search_type in param_mapping.items():
             if params.get(local_param):
+                query = params[local_param]
+                cache_key = (search_type, query)
+                if cache_key in seen:
+                    continue
+                seen.add(cache_key)
                 try:
                     response = requests.post(
                         self.base_url,
-                        json={"type": search_type, "query": params[local_param]},
+                        json={"type": search_type, "query": query},
                         headers={"Authorization": f"Bearer {self.api_key}"},
-                        timeout=10
+                        timeout=15
                     )
                     if response.status_code == 200:
                         data = response.json()
-                        results.append({
-                            "source": "nightsearch",
-                            "field": local_param,
-                            "value": params[local_param],
-                            "found": True,
-                            "data": data
-                        })
+                        results.append(_result_ok("nightsearch", local_param, query, data))
                 except Exception as e:
-                    results.append({
-                        "source": "nightsearch",
-                        "field": local_param,
-                        "value": params[local_param],
-                        "found": False,
-                        "error": str(e)
-                    })
+                    results.append(_result_err("nightsearch", local_param, query, e))
         
-        return {"success": len(results) > 0, "results": results, "total": len(results)}
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
 
 class DepSearchModule(BaseSearchModule):
-    """DepSearch API - универсальный поиск"""
-    
+    """DepSearch API — по документации https://depsearch.sbs/api-docs/
+
+    Формат: GET https://api.depsearch.sbs/quest?quest=VALUE&token=TOKEN&lang=ru
+    Тип запроса определяется автоматически или префиксами (nick:, snils, inn, vkid, addr:, tt:).
+    """
+
+    SUPPORTED_FIELDS = [
+        "phone", "email", "nick", "username", "name", "fio", "fullname", "passport",
+        "inn", "snils", "vin", "car_number", "ip", "telegram", "telegram_id",
+        "vk", "vk_id", "card", "imei", "address", "social",
+    ]
+    TIMEOUT = 20.0
+
     def __init__(self):
         self.base_url = "https://api.depsearch.sbs"
-        self.token = DEPSEARCH_TOKEN
-    
+        self.tokens = [t for t in (DEPSEARCH_TOKEN, API_KEY_DEPSEARCH) if t]
+
+    def _build_quest(self, field: str, value: str) -> Optional[str]:
+        value = str(value).strip()
+        if not value:
+            return None
+        if field == "phone":
+            return normalize_phone(value) or value
+        if field == "email":
+            return value
+        if field in ("nick", "username"):
+            return value if value.lower().startswith("nick:") else f"nick:{value.lstrip('@')}"
+        if field == "snils":
+            digits = re.sub(r"\D", "", value)
+            return f"snils{digits}" if digits else None
+        if field == "inn":
+            digits = re.sub(r"\D", "", value)
+            return f"inn{digits}" if digits else None
+        if field in ("vk", "vk_id"):
+            vk = extract_vk_id(value)
+            return f"vkid{vk}" if str(vk).isdigit() else value
+        if field == "address":
+            return value if value.lower().startswith(("addr:", "адрес:")) else f"addr:{value}"
+        if field in ("telegram", "telegram_id"):
+            # DepSearch не документирует TG отдельно — пробуем как nick
+            q = normalize_telegram_query(value)
+            return q if q.isdigit() else f"nick:{q.lstrip('@')}"
+        if field in ("name", "fio", "fullname"):
+            return value
+        if field in ("vin", "car_number", "ip", "passport", "card", "imei", "social"):
+            return value
+        return value
+
+    def _quest(self, quest: str) -> Tuple[Optional[dict], Optional[str]]:
+        last_error = None
+        for token in self.tokens:
+            response, err = self._get(
+                f"{self.base_url}/quest",
+                params={"quest": quest, "token": token, "lang": "ru"},
+            )
+            if err and response is None:
+                last_error = err
+                continue
+            if response is None:
+                last_error = err or "no response"
+                continue
+            if response.status_code == 401:
+                last_error = "token missing/invalid"
+                continue
+            if response.status_code == 403:
+                last_error = "token forbidden"
+                continue
+            if response.status_code == 429:
+                return None, "rate_limited"
+            if response.status_code != 200:
+                last_error = f"HTTP {response.status_code}"
+                continue
+            try:
+                data = response.json()
+            except Exception:
+                last_error = "invalid json"
+                continue
+            if isinstance(data, dict) and data.get("error"):
+                last_error = str(data.get("error"))
+                continue
+            if data:
+                return data, None
+            last_error = "empty"
+        return None, last_error or "DepSearch unavailable"
+
     def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
         results = []
-        
-        # Mapping параметров к типам поиска DepSearch
-        param_mapping = {
-            "phone": "phone",
-            "email": "email",
-            "nick": "nick",
-            "name": "name",
-            "passport": "passport",
-            "inn": "inn",
-            "snils": "snils",
-            "vin": "vin",
-            "car_number": "car_number",
-            "ip": "ip",
-            "telegram": "telegram",
-            "vk": "vk",
-            "card": "card",
-            "imei": "imei",
-            "address": "address",
-            "social": "social"
-        }
-        
-        for local_param, search_type in param_mapping.items():
-            if params.get(local_param):
-                try:
-                    response = requests.get(
-                        f"{self.base_url}/quest",
-                        params={"type": search_type, "q": params[local_param]},
-                        headers={"Authorization": f"Bearer {self.token}"},
-                        timeout=10
-                    )
-                    if response.status_code == 200:
-                        data = response.json()
-                        results.append({
-                            "source": "depsearch",
-                            "field": local_param,
-                            "value": params[local_param],
-                            "found": True,
-                            "data": data
-                        })
-                except Exception as e:
-                    results.append({
-                        "source": "depsearch",
-                        "field": local_param,
-                        "value": params[local_param],
-                        "found": False,
-                        "error": str(e)
-                    })
-        
-        return {"success": len(results) > 0, "results": results, "total": len(results)}
+        seen = set()
+        field_order = [
+            "phone", "email", "fio", "fullname", "name", "nick", "username",
+            "vk", "vk_id", "inn", "snils", "vin", "car_number", "ip",
+            "telegram", "telegram_id", "address", "passport", "card", "imei", "social",
+        ]
+        for field in field_order:
+            value = params.get(field)
+            if not value:
+                continue
+            quest = self._build_quest(field, value)
+            if not quest or quest in seen:
+                continue
+            seen.add(quest)
+            data, error = self._quest(quest)
+            if data is not None:
+                # Пустой results без полезных блоков — не считаем находкой
+                useful = False
+                if isinstance(data, dict):
+                    if data.get("results") or data.get("phone_info") or data.get("ip_info") or data.get("vk_info"):
+                        useful = True
+                    elif any(k not in ("search_type", "error") for k in data.keys()):
+                        useful = bool(data)
+                if useful:
+                    results.append(_result_ok("depsearch", field, value, data, quest=quest))
+            # ошибки модуля глотаем (circuit/лог), не засоряем ответ
+            elif error:
+                logger.debug("DepSearch %s: %s", quest, error)
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
+
 
 class TelegramHistoryModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["telegram", "telegram_id", "username", "nick"]
     """Telegram History API - история аккаунтов, подарки, смена имени"""
     
     def __init__(self):
@@ -644,6 +1004,8 @@ class TelegramHistoryModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class RaidFindModule(BaseSearchModule):
+    # auto-disabled: DNS/host недоступен
+    ENABLED = False
     """RaidFind API - премиум поиск"""
     
     def __init__(self):
@@ -702,288 +1064,356 @@ class RaidFindModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class VKAPIModule(BaseSearchModule):
-    """VK API - поиск информации о пользователях, группах, друзьях, постах"""
-    
+    """VK OSINT - профиль + группы/стена/друзья + внешние источники (как в Chronosphere)"""
+
+    SUPPORTED_FIELDS = ["vk", "vk_id"]
+
     def __init__(self):
-        self.base_url = "https://api.vk.com/method"
+        self.base_url = "https://api.vk.com/method/"
         self.token = VK_TOKEN
         self.version = VK_API_VERSION
-    
+        self._lock = threading.Lock()
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+
+    def _request(self, method: str, params: dict) -> dict:
+        payload = {**params, "access_token": self.token, "v": self.version}
+        try:
+            with self._lock:
+                response = self.session.get(f"{self.base_url}{method}", params=payload, timeout=20)
+            response.raise_for_status()
+            data = response.json()
+            if "error" in data:
+                return {"error": data["error"].get("error_msg", "Unknown error")}
+            return data.get("response", {})
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def _format_date(self, timestamp) -> str:
+        try:
+            return datetime.fromtimestamp(int(timestamp)).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            return str(timestamp)
+
+    def _clean_text(self, text: str, max_len: int = 500) -> str:
+        if not text:
+            return ""
+        text = re.sub(r"\s+", " ", str(text)).strip()
+        return text[:max_len] + "..." if len(text) > max_len else text
+
+    def _external_topdb(self, vk_id: str) -> Dict[str, Any]:
+        if BeautifulSoup is None:
+            return {"source": "TopDB", "error": "BeautifulSoup не установлен"}
+        try:
+            url = f"http://topdb.ru/id{vk_id}"
+            response = requests.get(url, headers=self.session.headers, timeout=15)
+            response.raise_for_status()
+            page_text = BeautifulSoup(response.content, "html.parser").get_text("\n", strip=True)
+            if "Пользователь не найден" in page_text:
+                return {"source": "TopDB", "url": url, "info": "Информация не найдена"}
+            start = -1
+            for marker in ("Полезное", "Личная информация", "Основное", "Интересы"):
+                start = page_text.find(marker)
+                if start != -1:
+                    break
+            if start == -1:
+                info = page_text[:1500]
+            else:
+                end = page_text.find("Контакты", start)
+                info = page_text[start:end if end != -1 else None]
+            return {"source": "TopDB", "url": url, "info": self._clean_text(info, 1500)}
+        except Exception as exc:
+            return {"source": "TopDB", "error": str(exc)}
+
+    def _external_poiski_pro(self, vk_id: str) -> Dict[str, Any]:
+        if BeautifulSoup is None:
+            return {"source": "Poiski.pro", "error": "BeautifulSoup не установлен"}
+        try:
+            url = f"https://poiski.pro/vk/user/id{vk_id}"
+            response = requests.get(url, headers=self.session.headers, timeout=15)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            for tag in soup(["script", "style"]):
+                tag.decompose()
+            lines = [line.strip() for line in soup.get_text("\n").splitlines() if len(line.strip()) > 3]
+            for index, line in enumerate(lines):
+                if "Адрес страницы" in line:
+                    lines = lines[:index]
+                    break
+            return {"source": "Poiski.pro", "url": url, "info": self._clean_text("\n".join(lines), 1500) or "Информация не найдена"}
+        except Exception as exc:
+            return {"source": "Poiski.pro", "error": str(exc)}
+
+    def _external_onli_vk(self, vk_id: str) -> Dict[str, Any]:
+        if BeautifulSoup is None:
+            return {"source": "Onli VK", "error": "BeautifulSoup не установлен"}
+        try:
+            url = f"https://onli-vk.ru/id{vk_id}"
+            response = requests.get(url, headers=self.session.headers, timeout=15)
+            response.raise_for_status()
+            page_text = BeautifulSoup(response.text, "html.parser").get_text("\n")
+            patterns = (
+                r"Online[^.]*", r"Онлайн[^.]*", r"Offline[^.]*?последняя активность[^.]*",
+                r"Оффлайн[^.]*?последняя активность[^.]*", r"был.*в сети[^.]*",
+                r"была.*в сети[^.]*", r"активность.*\d{1,2}\s+\w+\s+\d{4}",
+            )
+            for line in page_text.splitlines():
+                clean_line = " ".join(line.split())
+                if len(clean_line) < 5:
+                    continue
+                for pattern in patterns:
+                    match = re.search(pattern, clean_line, re.I)
+                    if match:
+                        return {"source": "Onli VK", "url": url, "activity": " ".join(match.group(0).split())}
+            return {"source": "Onli VK", "url": url, "activity": "Информация не найдена"}
+        except Exception as exc:
+            return {"source": "Onli VK", "error": str(exc)}
+
+    def _external_looka_one(self, vk_id: str) -> Dict[str, Any]:
+        if BeautifulSoup is None:
+            return {"source": "Looka.one", "error": "BeautifulSoup не установлен"}
+        try:
+            url = f"https://looka.one/vk_user/id{vk_id}"
+            response = requests.get(url, headers=self.session.headers, timeout=15)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            content = soup.find("div", class_="profile-info") or soup.find("main") or soup.find("article")
+            if not content:
+                return {"source": "Looka.one", "error": "Информация не найдена"}
+            info = content.get_text(" ", strip=True)
+            for phrase in (
+                "Ориентировочное положение на карте", "Эта страница создана на лету",
+                "путем запроса к API от ВКонтакте", "содержащего только открытые данные",
+                "Сайт Looka.one НЕ собирает и НЕ хранит данные", "Политика персональных данных",
+                "Удаление информации",
+            ):
+                info = info.replace(phrase, "")
+            info = self._clean_text(info, 1500)
+            if not info:
+                return {"source": "Looka.one", "error": "Информация не найдена"}
+            return {"source": "Looka.one", "url": url, "info": info}
+        except Exception as exc:
+            return {"source": "Looka.one", "error": str(exc)}
+
     def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
         results = []
-        
-        # Поиск по VK ID
-        vk_id = params.get("vk") or params.get("vk_id")
-        if vk_id:
-            # Извлечение числового ID из строки (например, из "id853724500" или "853724500")
-            import re
-            numeric_id = re.sub(r'[^0-9]', '', str(vk_id))
-            if not numeric_id:
-                numeric_id = vk_id
-            
-            # users.get
-            try:
-                response = requests.get(
-                    f"{self.base_url}/users.get",
-                    params={
-                        "user_ids": numeric_id,
-                        "fields": "photo_max,verified,sex,bdate,city,country,home_town,status,education,universities,schools,occupation,career,interests,music,movies,tv,books,games,about,activities,quotes,followers_count,online,last_seen",
-                        "access_token": self.token,
-                        "v": self.version
-                    },
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results.append({
-                        "source": "vk_api",
-                        "method": "users.get",
-                        "field": "vk",
-                        "value": vk_id,
-                        "found": True,
-                        "data": data
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "vk_api",
-                    "method": "users.get",
-                    "field": "vk",
-                    "value": vk_id,
-                    "found": False,
-                    "error": str(e)
-                })
-            
-            # groups.get
-            try:
-                response = requests.get(
-                    f"{self.base_url}/groups.get",
-                    params={
-                        "user_id": numeric_id,
-                        "extended": 1,
-                        "fields": "screen_name,description,members_count",
-                        "access_token": self.token,
-                        "v": self.version
-                    },
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results.append({
-                        "source": "vk_api",
-                        "method": "groups.get",
-                        "field": "vk",
-                        "value": vk_id,
-                        "found": True,
-                        "data": data
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "vk_api",
-                    "method": "groups.get",
-                    "field": "vk",
-                    "value": vk_id,
-                    "found": False,
-                    "error": str(e)
-                })
-            
-            # friends.get
-            try:
-                response = requests.get(
-                    f"{self.base_url}/friends.get",
-                    params={
-                        "user_id": numeric_id,
-                        "fields": "photo_50,online,last_seen",
-                        "access_token": self.token,
-                        "v": self.version
-                    },
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results.append({
-                        "source": "vk_api",
-                        "method": "friends.get",
-                        "field": "vk",
-                        "value": vk_id,
-                        "found": True,
-                        "data": data
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "vk_api",
-                    "method": "friends.get",
-                    "field": "vk",
-                    "value": vk_id,
-                    "found": False,
-                    "error": str(e)
-                })
-            
-            # wall.get
-            try:
-                response = requests.get(
-                    f"{self.base_url}/wall.get",
-                    params={
-                        "owner_id": numeric_id,
-                        "count": 20,
-                        "extended": 1,
-                        "access_token": self.token,
-                        "v": self.version
-                    },
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results.append({
-                        "source": "vk_api",
-                        "method": "wall.get",
-                        "field": "vk",
-                        "value": vk_id,
-                        "found": True,
-                        "data": data
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "vk_api",
-                    "method": "wall.get",
-                    "field": "vk",
-                    "value": vk_id,
-                    "found": False,
-                    "error": str(e)
-                })
-        
-        return {"success": len(results) > 0, "results": results, "total": len(results)}
+        raw_vk = params.get("vk") or params.get("vk_id")
+        if not raw_vk:
+            return {"success": False, "results": [], "total": 0}
+
+        vk_id = extract_vk_id(raw_vk)
+        modules: Dict[str, Any] = {}
+
+        user = self._request("users.get", {
+            "user_ids": vk_id,
+            "fields": "photo_max,verified,sex,bdate,city,country,home_town,status,education,about,activities,interests,music,movies,tv,books,games,quotes,online,last_seen,followers_count,occupation,relation,personal,schools,universities,domain",
+        })
+        if user and not (isinstance(user, dict) and user.get("error")):
+            user_data = user[0] if isinstance(user, list) and user else user
+            if isinstance(user_data, dict):
+                modules["user_info"] = {
+                    "id": user_data.get("id"),
+                    "first_name": user_data.get("first_name", ""),
+                    "last_name": user_data.get("last_name", ""),
+                    "domain": user_data.get("domain", ""),
+                    "sex": "Женский" if user_data.get("sex") == 1 else "Мужской" if user_data.get("sex") == 2 else "Не указан",
+                    "bdate": user_data.get("bdate", "Не указана"),
+                    "city": (user_data.get("city") or {}).get("title", "Не указан"),
+                    "country": (user_data.get("country") or {}).get("title", "Не указана"),
+                    "home_town": user_data.get("home_town", "Не указан"),
+                    "status": user_data.get("status", "Нет статуса"),
+                    "about": user_data.get("about", ""),
+                    "verified": user_data.get("verified", 0) == 1,
+                    "photo": user_data.get("photo_max", ""),
+                    "online": user_data.get("online", 0) == 1,
+                    "followers_count": user_data.get("followers_count", 0),
+                    "last_seen": self._format_date((user_data.get("last_seen") or {}).get("time", 0)) if user_data.get("last_seen") else "Неизвестно",
+                }
+                if user_data.get("id"):
+                    vk_id = str(user_data["id"])
+                results.append(_result_ok("vk_api", "vk", raw_vk, modules["user_info"], method="users.get"))
+        elif isinstance(user, dict) and user.get("error"):
+            results.append(_result_err("vk_api", "vk", raw_vk, user.get("error")))
+
+        for method_name, method, extra in (
+            ("groups.get", "groups.get", {"user_id": vk_id, "extended": 1, "fields": "name,members_count", "count": 50}),
+            ("friends.get", "friends.get", {"user_id": vk_id, "count": 20, "fields": "online"}),
+            ("wall.get", "wall.get", {"owner_id": vk_id, "count": 20, "extended": 1}),
+            ("users.getSubscriptions", "users.getSubscriptions", {"user_id": vk_id, "count": 20, "extended": 1}),
+            ("photos.get", "photos.get", {"owner_id": vk_id, "album_id": "profile", "count": 10, "extended": 1}),
+        ):
+            data = self._request(method, extra)
+            if isinstance(data, dict) and data.get("error"):
+                results.append(_result_err("vk_api", "vk", raw_vk, data.get("error")))
+            elif data:
+                results.append(_result_ok("vk_api", "vk", raw_vk, data, method=method_name))
+
+        for name, func in (
+            ("topdb", self._external_topdb),
+            ("poiski_pro", self._external_poiski_pro),
+            ("onli_vk", self._external_onli_vk),
+            ("looka_one", self._external_looka_one),
+        ):
+            external = func(vk_id)
+            if external.get("error"):
+                results.append(_result_err(f"vk_{name}", "vk", raw_vk, external.get("error")))
+            else:
+                results.append(_result_ok(f"vk_{name}", "vk", raw_vk, external, method=name))
+
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
+
 
 class TruecallerModule(BaseSearchModule):
-    """Truecaller API - поиск по номеру телефона"""
-    
+    """Truecaller search5 — Authorization: Bearer <installationId>"""
+
+    SUPPORTED_FIELDS = ["phone", "number"]
+    TIMEOUT = 4.0
+    # Truecaller часто таймаутит/требует VPN — после 3 фейлов circuit breaker отключит автоматически
+
     def __init__(self):
-        self.base_url = "https://search5-noneu.truecaller.com/v2/search"
+        self.hosts = [
+            "https://search5-noneu.truecaller.com/v2/search",
+            "https://search5.truecaller.com/v2/search",
+        ]
         self.installation_id = TRUECALLER_INSTALLATION_ID
-    
+
     def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
         results = []
-        
-        if params.get("phone"):
-            try:
-                response = requests.get(
-                    self.base_url,
-                    params={"q": params["phone"]},
-                    headers={"X-Installation-Id": self.installation_id},
-                    timeout=10
-                )
-                if response.status_code == 200:
+        phone = params.get("phone") or params.get("number")
+        if not phone:
+            return {"success": False, "results": [], "total": 0}
+        normalized = normalize_phone_e164(phone)
+        query_params = {
+            "q": normalized,
+            "countryCode": "RU",
+            "type": "4",
+            "encoding": "json",
+            "placement": "SEARCHRESULTS,HISTORY,DETAILS",
+        }
+        headers = {
+            "User-Agent": "Truecaller/14.1.6 (Android;14)",
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=UTF-8",
+            "Authorization": f"Bearer {self.installation_id}",
+        }
+        last_error = None
+        for url in self.hosts:
+            response, err = self._get(url, params=query_params, headers=headers)
+            if response is None:
+                last_error = err
+                # timeout/connection — не тратим время на остальные хосты
+                if err and (err.startswith("timeout") or err.startswith("connection_error") or err.startswith("circuit_open")):
+                    break
+                continue
+            if response.status_code == 200:
+                try:
                     data = response.json()
-                    results.append({
-                        "source": "truecaller",
-                        "field": "phone",
-                        "value": params["phone"],
-                        "found": True,
-                        "data": data
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "truecaller",
-                    "field": "phone",
-                    "value": params["phone"],
-                    "found": False,
-                    "error": str(e)
-                })
-        
-        return {"success": len(results) > 0, "results": results, "total": len(results)}
+                except Exception:
+                    last_error = "invalid json"
+                    continue
+                records = data.get("data") or []
+                if not records:
+                    return {"success": False, "results": [], "total": 0}
+                record = records[0]
+                flat = {
+                    "name": record.get("name"),
+                    "phone": record.get("phones", [{}])[0].get("e164Format") if record.get("phones") else record.get("phoneNumber") or normalized,
+                    "country": (record.get("addresses") or [{}])[0].get("countryCode") if record.get("addresses") else record.get("countryCode"),
+                    "carrier": (record.get("phones") or [{}])[0].get("carrier") if record.get("phones") else record.get("carrier"),
+                    "score": record.get("score"),
+                    "spam_score": (record.get("spamInfo") or {}).get("spamScore"),
+                    "raw": record,
+                }
+                flat = {k: v for k, v in flat.items() if v not in (None, [], {})}
+                results.append(_result_ok("truecaller", "phone", phone, flat))
+                return {"success": True, "results": results, "total": len(results)}
+            if response.status_code in (401, 403):
+                last_error = f"auth HTTP {response.status_code}"
+                break
+            last_error = f"HTTP {response.status_code}"
+        if last_error:
+            logger.debug("Truecaller skip: %s", last_error)
+        return {"success": False, "results": [], "total": 0}
+
 
 class InfinitySearchModule(BaseSearchModule):
     """Infinity Search API - поиск по телефону, email, ФИО"""
-    
+
+    SUPPORTED_FIELDS = ["phone", "number", "email", "fio", "fullname", "name", "bdate"]
+
     def __init__(self):
         self.base_url = INFINITY_SEARCH_URL
-        self.token = INFINITY_SEARCH_TOKEN
-    
+        if not self.base_url.endswith("find.php"):
+            self.base_url = self.base_url.rstrip("/") + "/find.php"
+        self.tokens = [t for t in (INFINITY_SEARCH_TOKEN, INFINITY_SEARCH_TOKEN_ALT, INFINITY_SEARCH_API_KEY) if t]
+        self._lock = threading.Lock()
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "GloomApi/2.1"})
+
+    def _get(self, params: dict) -> Tuple[Optional[dict], Optional[str]]:
+        last_error = None
+        for token in self.tokens:
+            try:
+                with self._lock:
+                    response = self.session.get(
+                        self.base_url,
+                        params={**params, "token": token},
+                        timeout=30,
+                    )
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("results"):
+                        return data, None
+                    last_error = "Данные не найдены"
+                else:
+                    last_error = f"HTTP {response.status_code}"
+            except Exception as exc:
+                last_error = str(exc)
+        return None, last_error or "Infinity недоступен"
+
     def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
         results = []
-        
-        # Поиск по телефону
-        if params.get("phone"):
-            try:
-                response = requests.get(
-                    f"{self.base_url}/find.php",
-                    params={"phone": params["phone"], "token": self.token},
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results.append({
-                        "source": "infinity_search",
-                        "field": "phone",
-                        "value": params["phone"],
-                        "found": True,
-                        "data": data
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "infinity_search",
-                    "field": "phone",
-                    "value": params["phone"],
-                    "found": False,
-                    "error": str(e)
-                })
-        
-        # Поиск по ФИО
-        if params.get("fio") or params.get("fullname") or params.get("name"):
-            fio = params.get("fio") or params.get("fullname") or params.get("name")
-            try:
-                from urllib.parse import quote
-                response = requests.get(
-                    f"{self.base_url}/find.php",
-                    params={"fio": quote(fio), "token": self.token},
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results.append({
-                        "source": "infinity_search",
-                        "field": "fio",
-                        "value": fio,
-                        "found": True,
-                        "data": data
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "infinity_search",
-                    "field": "fio",
-                    "value": fio,
-                    "found": False,
-                    "error": str(e)
-                })
-        
-        # Поиск по email
+
+        if params.get("phone") or params.get("number"):
+            phone = params.get("phone") or params.get("number")
+            clean = normalize_phone(phone)
+            data, error = self._get({"phone": clean})
+            if data:
+                results.append(_result_ok("infinity_search", "phone", phone, data))
+            elif error:
+                results.append(_result_err("infinity_search", "phone", phone, error))
+
+        fio = params.get("fio") or params.get("fullname") or params.get("name")
+        if fio:
+            query = {"fio": fio}
+            if params.get("bdate"):
+                query["bdate"] = params["bdate"]
+            else:
+                bdate_match = re.search(r"(\d{2}\.\d{2}\.\d{4})", str(fio))
+                if bdate_match:
+                    query["fio"] = re.sub(r"\d{2}\.\d{2}\.\d{4}", "", str(fio)).strip() or fio
+                    query["bdate"] = bdate_match.group(1)
+            data, error = self._get(query)
+            if data:
+                results.append(_result_ok("infinity_search", "fio", fio, data))
+            elif error:
+                results.append(_result_err("infinity_search", "fio", fio, error))
+
         if params.get("email"):
-            try:
-                response = requests.get(
-                    f"{self.base_url}/find.php",
-                    params={"email": params["email"], "token": self.token},
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results.append({
-                        "source": "infinity_search",
-                        "field": "email",
-                        "value": params["email"],
-                        "found": True,
-                        "data": data
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "infinity_search",
-                    "field": "email",
-                    "value": params["email"],
-                    "found": False,
-                    "error": str(e)
-                })
-        
-        return {"success": len(results) > 0, "results": results, "total": len(results)}
+            email = params["email"]
+            data, error = self._get({"email": email})
+            if data:
+                results.append(_result_ok("infinity_search", "email", email, data))
+            elif error:
+                results.append(_result_err("infinity_search", "email", email, error))
+
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
 
 class FaceSearchModule(BaseSearchModule):
+    # auto-disabled: требует photo_url и внешний bff
+    ENABLED = False
     """Face Search API - поиск лиц по фото (detect-faces, search-faces)"""
     
     def __init__(self):
@@ -1051,6 +1481,8 @@ class FaceSearchModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class DeepScanModule(BaseSearchModule):
+    ENABLED = False  # DNS недоступен
+    SUPPORTED_FIELDS = ["phone", "email", "fio", "fullname", "name", "nick", "username"]
     """DeepScan API - поиск по телефону, email, ФИО, никнеймам"""
     
     def __init__(self):
@@ -1106,6 +1538,8 @@ class DeepScanModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class BigBaseModule(BaseSearchModule):
+    # auto-disabled: ошибка авторизации
+    ENABLED = False
     """BigBase API - универсальный поиск и открытие досье"""
     
     def __init__(self):
@@ -1164,6 +1598,8 @@ class BigBaseModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class OnuxModule(BaseSearchModule):
+    # auto-disabled: DNS недоступен
+    ENABLED = False
     """Onux API - универсальный поиск по различным параметрам"""
     
     def __init__(self):
@@ -1223,6 +1659,8 @@ class OnuxModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class TulasayModule(BaseSearchModule):
+    ENABLED = False  # connection refused
+    SUPPORTED_FIELDS = ["phone", "email", "fio", "fullname", "name", "passport", "inn", "snils"]
     """Tulasay API - унифицированный поиск через JyCode Gateway"""
     
     def __init__(self):
@@ -1290,6 +1728,8 @@ class TulasayModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class RedMaskModule(BaseSearchModule):
+    # auto-disabled: ngrok URL нестабилен
+    ENABLED = False
     """RedMask API - универсальный поиск по телефону, Telegram, VK"""
     
     def __init__(self):
@@ -1366,6 +1806,7 @@ class RedMaskModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class IPInfoModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["ip"]
     """IPInfo API - геолокация и информация об IP"""
     
     def __init__(self):
@@ -1403,6 +1844,7 @@ class IPInfoModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class IPStackModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["ip"]
     """IPStack API - геолокация IP"""
     
     def __init__(self):
@@ -1443,6 +1885,7 @@ class IPStackModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class IPGeolocationModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["ip"]
     """IPGeolocation API - геолокация IP"""
     
     def __init__(self):
@@ -1485,6 +1928,8 @@ class IPGeolocationModule(BaseSearchModule):
 
 class IPDataModule(BaseSearchModule):
     """IPData API - информация об IP"""
+    # auto-disabled: invalid API key
+    ENABLED = False
     
     def __init__(self):
         self.base_url = "https://api.ipdata.co"
@@ -1521,6 +1966,7 @@ class IPDataModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class IPBaseModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["ip"]
     """IPBase API - геолокация IP"""
     
     def __init__(self):
@@ -1558,6 +2004,7 @@ class IPBaseModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class IP2LocationModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["ip"]
     """IP2Location API - геолокация IP"""
     
     def __init__(self):
@@ -1599,6 +2046,7 @@ class IP2LocationModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class NumVerifyModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["phone", "number"]
     """NumVerify API - валидация телефонных номеров"""
     
     def __init__(self):
@@ -1641,6 +2089,7 @@ class NumVerifyModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class MailboxlayerModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["email"]
     """Mailboxlayer API - валидация email"""
     
     def __init__(self):
@@ -1683,6 +2132,7 @@ class MailboxlayerModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class EmailValidModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["email"]
     """EmailValid API (APIVerve) - валидация email"""
     
     def __init__(self):
@@ -1721,6 +2171,7 @@ class EmailValidModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class EmailReputationModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["email"]
     """EmailReputation API (Abstract) - проверка репутации email"""
     
     def __init__(self):
@@ -1759,6 +2210,8 @@ class EmailReputationModule(BaseSearchModule):
 
 class VeriPhoneModule(BaseSearchModule):
     """VeriPhone API - валидация телефонных номеров"""
+    ENABLED = False  # insufficient credits (402)
+    SUPPORTED_FIELDS = ["phone", "number"]
     
     def __init__(self):
         self.base_url = "https://api.veriphone.io"
@@ -1795,6 +2248,7 @@ class VeriPhoneModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class ProxyCheckModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["ip"]
     """ProxyCheck API - проверка IP на прокси/VPN"""
     
     def __init__(self):
@@ -1839,6 +2293,7 @@ class ProxyCheckModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class AbuseIPDBModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["ip"]
     """AbuseIPDB API - проверка IP на злоупотребления"""
     
     def __init__(self):
@@ -1857,7 +2312,7 @@ class AbuseIPDBModule(BaseSearchModule):
                         "maxAgeInDays": 90,
                         "verbose": ""
                     },
-                    headers={"Key": self.api_key},
+                    headers={"Key": self.api_key, "Accept": "application/json"},
                     timeout=10
                 )
                 if response.status_code == 200:
@@ -1881,43 +2336,37 @@ class AbuseIPDBModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class ShodanModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["ip"]
     """Shodan API - киберразведка по IP"""
-    
+    TIMEOUT = 10.0
+
     def __init__(self):
         self.base_url = "https://api.shodan.io"
-        self.api_key = SHODAN_API_KEY
-    
+        self.api_keys = [k for k in (SHODAN_API_KEY_ALT, SHODAN_API_KEY) if k]
+
     def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
         results = []
-        
-        if params.get("ip"):
-            try:
-                response = requests.get(
-                    f"{self.base_url}/shodan/host/{params['ip']}",
-                    params={"key": self.api_key},
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results.append({
-                        "source": "shodan",
-                        "field": "ip",
-                        "value": params["ip"],
-                        "found": True,
-                        "data": data
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "shodan",
-                    "field": "ip",
-                    "value": params["ip"],
-                    "found": False,
-                    "error": str(e)
-                })
-        
-        return {"success": len(results) > 0, "results": results, "total": len(results)}
+        ip = params.get("ip")
+        if not ip:
+            return {"success": False, "results": [], "total": 0}
+        last_error = None
+        for key in self.api_keys:
+            response, err = self._get(
+                f"{self.base_url}/shodan/host/{ip}",
+                params={"key": key},
+            )
+            if response is not None and response.status_code == 200:
+                results.append(_result_ok("shodan", "ip", ip, response.json()))
+                break
+            last_error = err or (f"HTTP {response.status_code}" if response is not None else "no response")
+        if not results and last_error:
+            logger.debug("Shodan: %s", last_error)
+        return {"success": bool(results), "results": results, "total": len(results)}
+
 
 class HunterModule(BaseSearchModule):
+    # auto-disabled: placeholder API key
+    ENABLED = False
     """Hunter API - поиск email по домену"""
     
     def __init__(self):
@@ -1980,153 +2429,179 @@ class HunterModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class HIBPModule(BaseSearchModule):
-    """Have I Been Pwned API - проверка утечек данных"""
-    
+    """Have I Been Pwned — breachedaccount (email) + Pwned Passwords range API"""
+
+    SUPPORTED_FIELDS = ["email", "password"]
+    TIMEOUT = 10.0
+
     def __init__(self):
         self.base_url = "https://haveibeenpwned.com/api/v3"
+        self.passwords_url = "https://api.pwnedpasswords.com"
         self.api_key = HIBP_API_KEY
-    
+        # placeholder keys are skipped for authenticated endpoints
+        self._key_usable = bool(self.api_key) and not self.api_key.startswith("0123456789abcdef")
+
     def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
         results = []
-        
-        if params.get("email"):
-            try:
-                import hashlib
-                sha1 = hashlib.sha1(params["email"].lower().encode()).hexdigest().upper()
-                prefix = sha1[:5]
-                suffix = sha1[5:]
-                
-                response = requests.get(
-                    f"{self.base_url}/range/{prefix}",
-                    headers={
-                        "hibp-api-key": self.api_key,
-                        "User-Agent": "GloomAPI"
-                    },
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.text
-                    results.append({
-                        "source": "hibp",
-                        "field": "email",
-                        "value": params["email"],
-                        "found": True,
-                        "data": {"range": data, "suffix": suffix}
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "hibp",
-                    "field": "email",
-                    "value": params["email"],
-                    "found": False,
-                    "error": str(e)
-                })
-        
-        return {"success": len(results) > 0, "results": results, "total": len(results)}
+        if params.get("email") and self._key_usable:
+            email = params["email"]
+            response, err = self._get(
+                f"{self.base_url}/breachedaccount/{urllib.parse.quote(email)}",
+                params={"truncateResponse": "false"},
+                headers={
+                    "hibp-api-key": self.api_key,
+                    "user-agent": "GloomApi",
+                    "Accept": "application/json",
+                },
+            )
+            if response is not None and response.status_code == 200:
+                results.append(_result_ok("hibp", "email", email, response.json()))
+            elif response is not None and response.status_code == 404:
+                pass  # not breached
+            elif err:
+                logger.debug("HIBP email: %s", err)
+
+        # Pwned Passwords — публичный k-anonymity range API (без ключа)
+        password = params.get("password")
+        if password:
+            sha1 = hashlib.sha1(str(password).encode("utf-8")).hexdigest().upper()
+            prefix, suffix = sha1[:5], sha1[5:]
+            response, err = self._get(
+                f"{self.passwords_url}/range/{prefix}",
+                headers={"User-Agent": "GloomApi", "Add-Padding": "true"},
+            )
+            if response is not None and response.status_code == 200:
+                count = 0
+                for line in response.text.splitlines():
+                    parts = line.split(":")
+                    if len(parts) >= 2 and parts[0].strip().upper() == suffix:
+                        count = int(parts[1].strip().split("*")[0] or 0)
+                        break
+                results.append(_result_ok("hibp_passwords", "password", "***", {
+                    "breached": count > 0,
+                    "count": count,
+                }))
+            elif err:
+                logger.debug("HIBP passwords: %s", err)
+
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
+
 
 class LeakCheckModule(BaseSearchModule):
-    """LeakCheck API - проверка утечек данных"""
-    
+    """LeakCheck — Pro API v2 + Public API fallback (docs.leakcheck.io)"""
+
+    SUPPORTED_FIELDS = ["email", "phone", "username", "nick", "domain", "ip"]
+    TIMEOUT = 12.0
+
     def __init__(self):
-        self.base_url = "https://api.leakcheck.io"
+        self.pro_url = "https://leakcheck.io/api/v2"
+        self.public_url = "https://leakcheck.io/api/public"
         self.api_key = LEAKCHECK_API_KEY
-    
+        # ключ из репозитория — placeholder hex, Pro не пройдёт
+        self._pro_usable = bool(self.api_key) and "REAL" not in self.api_key.upper() and len(self.api_key) >= 40 and not self.api_key.startswith("49535f")
+
     def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
         results = []
-        
-        # LeakCheck supports email, phone, ip
-        query = params.get("email") or params.get("phone") or params.get("ip")
-        if query:
-            try:
-                import base64
-                query_type = "email" if params.get("email") else "phone" if params.get("phone") else "ip"
-                query_b64 = base64.b64encode(query.encode()).decode()
-                
-                response = requests.get(
-                    f"{self.base_url}/check/{query_type}/{query_b64}",
-                    headers={"X-API-Key": self.api_key},
-                    timeout=10
+        candidates = []
+        for field, qtype in (
+            ("email", "email"),
+            ("phone", "phone"),
+            ("username", "username"),
+            ("nick", "username"),
+            ("domain", "domain"),
+            ("ip", None),
+        ):
+            if params.get(field):
+                candidates.append((field, params[field], qtype))
+        seen = set()
+        for field, query, qtype in candidates:
+            if query in seen:
+                continue
+            seen.add(query)
+            # Pro API
+            if self._pro_usable:
+                req_params = {"limit": 100}
+                if qtype:
+                    req_params["type"] = qtype
+                response, err = self._get(
+                    f"{self.pro_url}/query/{urllib.parse.quote(str(query), safe='')}",
+                    params=req_params,
+                    headers={"Accept": "application/json", "X-API-Key": self.api_key},
                 )
-                if response.status_code == 200:
+                if response is not None and response.status_code == 200:
                     data = response.json()
-                    results.append({
-                        "source": "leakcheck",
-                        "field": query_type,
-                        "value": query,
-                        "found": True,
-                        "data": data
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "leakcheck",
-                    "field": "query",
-                    "value": query,
-                    "found": False,
-                    "error": str(e)
-                })
-        
-        return {"success": len(results) > 0, "results": results, "total": len(results)}
+                    if data.get("success") or data.get("found"):
+                        results.append(_result_ok("leakcheck", field, query, data, api="pro"))
+                        continue
+                elif response is not None and response.status_code in (400, 401):
+                    self._pro_usable = False
+
+            # Public API — только email/username (без IP)
+            if field in ("email", "username", "nick") or "@" in str(query):
+                response, err = self._get(
+                    self.public_url,
+                    params={"check": query},
+                    headers={"Accept": "application/json"},
+                )
+                if response is not None and response.status_code == 200:
+                    data = response.json()
+                    if data.get("success") and data.get("found"):
+                        results.append(_result_ok("leakcheck", field, query, data, api="public"))
+                elif err:
+                    logger.debug("LeakCheck public: %s", err)
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
+
 
 class SnusbaseModule(BaseSearchModule):
-    """Snusbase API - поиск в базах данных"""
-    
+    """Snusbase — POST /data/search, header Auth: <api_key>"""
+
+    SUPPORTED_FIELDS = ["email", "username", "nick", "ip", "phone", "name", "fio", "fullname", "password", "hash"]
+    TIMEOUT = 10.0
+
     def __init__(self):
         self.base_url = "https://api.snusbase.com"
         self.key = SNUSBASE_KEY
-        self.secret = SNUSBASE_SECRET
-    
+
     def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
         results = []
-        
-        # Snusbase supports email, username, ip, phone
-        query = params.get("email") or params.get("username") or params.get("ip") or params.get("phone")
-        if query:
-            try:
-                import hmac
-                import hashlib
-                import time
-                
-                timestamp = int(time.time())
-                term_type = "email" if params.get("email") else "username" if params.get("username") else "ip" if params.get("ip") else "phone"
-                
-                signature = hmac.new(
-                    self.secret.encode(),
-                    f"{self.key}{timestamp}{term_type}{query}".encode(),
-                    hashlib.sha256
-                ).hexdigest()
-                
-                response = requests.get(
-                    f"{self.base_url}/search",
-                    params={
-                        "key": self.key,
-                        "type": term_type,
-                        "term": query,
-                        "timestamp": timestamp,
-                        "signature": signature
-                    },
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results.append({
-                        "source": "snusbase",
-                        "field": term_type,
-                        "value": query,
-                        "found": True,
-                        "data": data
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "snusbase",
-                    "field": "query",
-                    "value": query,
-                    "found": False,
-                    "error": str(e)
-                })
-        
-        return {"success": len(results) > 0, "results": results, "total": len(results)}
+        type_map = [
+            ("email", "email"),
+            ("username", "username"),
+            ("nick", "username"),
+            ("ip", "lastip"),
+            ("phone", "phone"),
+            ("name", "name"),
+            ("fio", "name"),
+            ("fullname", "name"),
+            ("password", "password"),
+            ("hash", "hash"),
+        ]
+        terms = []
+        types = []
+        for field, t in type_map:
+            if params.get(field) and params[field] not in terms:
+                terms.append(params[field])
+                types.append(t)
+        if not terms:
+            return {"success": False, "results": [], "total": 0}
+
+        response, err = self._post(
+            f"{self.base_url}/data/search",
+            json={"terms": terms[:10], "types": types[:10]},
+            headers={"Auth": self.key, "Content-Type": "application/json", "Accept": "application/json"},
+        )
+        if response is not None and response.status_code == 200:
+            data = response.json()
+            if data.get("results") or data.get("size"):
+                results.append(_result_ok("snusbase", "query", terms[0], data))
+        elif err:
+            logger.debug("Snusbase: %s", err)
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
+
 
 class DehashedModule(BaseSearchModule):
+    # auto-disabled: placeholder API key
+    ENABLED = False
     """Dehashed API - поиск в утекших базах"""
     
     def __init__(self):
@@ -2174,6 +2649,8 @@ class DehashedModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class WeLeakInfoModule(BaseSearchModule):
+    # auto-disabled: placeholder API key
+    ENABLED = False
     """WeLeakInfo API - поиск утечек данных"""
     
     def __init__(self):
@@ -2212,6 +2689,8 @@ class WeLeakInfoModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class CensysModule(BaseSearchModule):
+    # auto-disabled: placeholder credentials
+    ENABLED = False
     """Censys API - киберразведка по IP"""
     
     def __init__(self):
@@ -2254,6 +2733,8 @@ class CensysModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class BinaryEdgeModule(BaseSearchModule):
+    # auto-disabled: placeholder API key
+    ENABLED = False
     """BinaryEdge API - киберразведка по IP"""
     
     def __init__(self):
@@ -2291,6 +2772,7 @@ class BinaryEdgeModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class GreyNoiseModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["ip"]
     """GreyNoise API - проверка IP на шум"""
     
     def __init__(self):
@@ -2302,13 +2784,18 @@ class GreyNoiseModule(BaseSearchModule):
         
         if params.get("ip"):
             try:
+                # Community API: key header optional; 404 = IP not observed (валидный ответ)
+                headers = {"Accept": "application/json", "key": self.api_key} if self.api_key and not str(self.api_key).startswith("gn-123") else {"Accept": "application/json"}
                 response = requests.get(
                     f"{self.base_url}/v3/community/{params['ip']}",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    headers=headers,
                     timeout=10
                 )
-                if response.status_code == 200:
-                    data = response.json()
+                if response.status_code in (200, 404):
+                    try:
+                        data = response.json()
+                    except Exception:
+                        data = {"raw": response.text[:500], "status": response.status_code}
                     results.append({
                         "source": "greynoise",
                         "field": "ip",
@@ -2328,6 +2815,8 @@ class GreyNoiseModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class IntelXModule(BaseSearchModule):
+    # auto-disabled: placeholder API key
+    ENABLED = False
     """IntelX API - поиск в утечках данных"""
     
     def __init__(self):
@@ -2377,6 +2866,7 @@ class IntelXModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class OFDataModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["inn", "ogrn", "name", "fio", "fullname"]
     """OFData API - поиск по российским данным"""
     
     def __init__(self):
@@ -2416,6 +2906,8 @@ class OFDataModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class FishAPIModule(BaseSearchModule):
+    # auto-disabled: host нестабилен
+    ENABLED = False
     """FishAPI - универсальный поиск"""
     
     def __init__(self):
@@ -2454,6 +2946,7 @@ class FishAPIModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class LeakIXModule(BaseSearchModule):
+    SUPPORTED_FIELDS = ["ip", "domain"]
     """LeakIX API - поиск утечек данных"""
     
     def __init__(self):
@@ -2492,6 +2985,8 @@ class LeakIXModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class BlackEyeModule(BaseSearchModule):
+    ENABLED = False  # connection reset
+    SUPPORTED_FIELDS = ["phone", "email", "username", "nick", "ip"]
     """BlackEye API - универсальный поиск"""
     
     def __init__(self):
@@ -2530,6 +3025,8 @@ class BlackEyeModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class CoreAPIModule(BaseSearchModule):
+    # auto-disabled: IP endpoint нестабилен
+    ENABLED = False
     """CoreAPI - универсальный поиск"""
     
     def __init__(self):
@@ -2568,6 +3065,8 @@ class CoreAPIModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class WhiteSearchModule(BaseSearchModule):
+    # auto-disabled: эндпоинт 404
+    ENABLED = False
     """WhiteSearch API - универсальный поиск"""
     
     def __init__(self):
@@ -2606,6 +3105,8 @@ class WhiteSearchModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class W2SP3RModule(BaseSearchModule):
+    # auto-disabled: непроверенный ключ
+    ENABLED = False
     """W2SP3R API - универсальный поиск"""
     
     def __init__(self):
@@ -2644,6 +3145,8 @@ class W2SP3RModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class QuickFlowModule(BaseSearchModule):
+    # auto-disabled: непроверенный ключ
+    ENABLED = False
     """QuickFlow API - универсальный поиск"""
     
     def __init__(self):
@@ -2682,6 +3185,8 @@ class QuickFlowModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class FunStatModule(BaseSearchModule):
+    # auto-disabled: непроверенный ключ
+    ENABLED = False
     """FunStat API - поиск статистики"""
     
     def __init__(self):
@@ -2720,6 +3225,8 @@ class FunStatModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class GerhanoModule(BaseSearchModule):
+    # auto-disabled: эндпоинт 404
+    ENABLED = False
     """Gerhano API - универсальный поиск"""
     
     def __init__(self):
@@ -2757,72 +3264,821 @@ class GerhanoModule(BaseSearchModule):
         
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
+
+# ============================================================================
+# МОДУЛИ ИЗ Chronosphere (vv.py) — отсутствовавшие ранее
+# ============================================================================
+
+class LeakLookupModule(BaseSearchModule):
+    ENABLED = False  # сессия истекла (login page)
+    """Leak-Lookup.com — поиск по phone/email через PHP-сессию"""
+
+    SUPPORTED_FIELDS = ["phone", "number", "email"]
+
+    def __init__(self, session_id: str = None):
+        self.session_id = session_id or LEAK_LOOKUP_SESSION
+        self.base_url = "https://leak-lookup.com"
+        self.timeout = 30.0
+        self._lock = threading.Lock()
+        self.session = self._make_session(self.session_id)
+
+    def _make_session(self, session_id: str) -> requests.Session:
+        client = requests.Session()
+        client.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+        if session_id:
+            client.cookies.set("PHPSESSID", session_id, domain="leak-lookup.com", path="/")
+        return client
+
+    def _clean_text(self, node) -> str:
+        if node is None:
+            return ""
+        return " ".join(node.get_text(" ", strip=True).split())
+
+    def _parse_table(self, table) -> dict:
+        caption = table.find("caption")
+        headers = [self._clean_text(cell) for cell in table.select("thead th")]
+        rows = []
+        for row in table.select("tbody tr") or table.select("tr"):
+            cells = row.find_all(["th", "td"], recursive=False)
+            if not cells:
+                continue
+            values = [self._clean_text(cell) for cell in cells]
+            if headers and len(headers) == len(values):
+                rows.append(dict(zip(headers, values)))
+            else:
+                rows.append(values)
+        return {
+            "title": self._clean_text(caption) if caption else "",
+            "headers": headers,
+            "rows": rows,
+        }
+
+    def _is_login_page(self, response: requests.Response) -> bool:
+        path = response.url.lower().rstrip("/")
+        if path.endswith("/login"):
+            return True
+        if BeautifulSoup is None:
+            return "type=\"password\"" in response.text.lower()
+        soup = BeautifulSoup(response.text, "html.parser")
+        return bool(soup.select_one('form input[type="password"]'))
+
+    def _hidden_form_fields(self, html: str) -> Dict[str, str]:
+        if BeautifulSoup is None:
+            return {}
+        soup = BeautifulSoup(html, "html.parser")
+        form = soup.find("form", action=re.compile(r"(?:^|/)search/?$"))
+        if form is None:
+            return {}
+        fields: Dict[str, str] = {}
+        for element in form.select('input[type="hidden"][name]'):
+            fields[str(element["name"])] = str(element.get("value", ""))
+        return fields
+
+    def _recent_search_count(self, html: str, query: str) -> Optional[int]:
+        if BeautifulSoup is None:
+            return None
+        soup = BeautifulSoup(html, "html.parser")
+        for item in soup.select(".recent-search"):
+            if str(item.get("data-search-query", "")) != query:
+                continue
+            badge = item.select_one(".results-badge-count")
+            if badge is None:
+                continue
+            digits = re.sub(r"[^0-9]", "", self._clean_text(badge))
+            return int(digits) if digits else 0
+        return None
+
+    def _parse_results(self, html: str, final_url: str, query: str) -> Dict[str, Any]:
+        if BeautifulSoup is None:
+            return {"query": query, "url": final_url, "total_results": 0, "raw_preview": html[:2000]}
+        soup = BeautifulSoup(html, "html.parser")
+        tables = []
+        for table in soup.select("table"):
+            parsed = self._parse_table(table)
+            if parsed["rows"]:
+                tables.append(parsed)
+        cards = []
+        for card in soup.select(".card"):
+            heading = card.select_one(".card-header, .card-title, h1, h2, h3, h4, h5")
+            body = card.select_one(".card-body") or card
+            text = self._clean_text(body)
+            if text:
+                cards.append({
+                    "title": self._clean_text(heading) if heading else "",
+                    "text": text,
+                })
+        flat_data: Dict[str, Any] = {"query": query, "url": final_url, "total_results": 0}
+        for table in tables:
+            for row in table["rows"]:
+                if isinstance(row, dict):
+                    for key, value in row.items():
+                        if value and str(value).strip():
+                            existing = flat_data.get(key)
+                            if existing and existing != value:
+                                flat_data[key] = f"{existing} · {value}"
+                            else:
+                                flat_data[key] = value
+                elif isinstance(row, list) and len(row) >= 2:
+                    flat_data[str(row[0])] = row[1] if len(row) == 2 else ", ".join(str(r) for r in row)
+        for card in cards:
+            if card["title"]:
+                flat_data[card["title"]] = card["text"]
+        flat_data["total_results"] = max(len(tables), len(cards), int(bool(tables or cards)))
+        return flat_data
+
+    def _search_query(self, query: str) -> Dict[str, Any]:
+        with self._lock:
+            try:
+                form_response = self.session.get(f"{self.base_url}/search", timeout=self.timeout)
+                form_response.raise_for_status()
+                if self._is_login_page(form_response):
+                    return {"success": False, "error": "Сессия Leak-Lookup истекла. Обновите LEAK_LOOKUP_SESSION."}
+
+                payload = list(self._hidden_form_fields(form_response.text).items())
+                payload.extend(("search-type[]", item) for item in ("1", "4"))
+                payload.extend((("search-query", query), ("submit", "")))
+
+                response = self.session.post(
+                    f"{self.base_url}/search",
+                    data=payload,
+                    headers={
+                        "Origin": self.base_url,
+                        "Referer": f"{self.base_url}/search",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                )
+                response.raise_for_status()
+
+                location = response.headers.get("Location", "")
+                if location:
+                    redirect_url = urllib.parse.urljoin(response.url, location)
+                    response = self.session.get(
+                        redirect_url,
+                        headers={"Referer": f"{self.base_url}/search"},
+                        timeout=self.timeout,
+                    )
+                    response.raise_for_status()
+
+                if response.url.rstrip("/") == f"{self.base_url}/search":
+                    count = self._recent_search_count(response.text, query)
+                    if count == 0:
+                        return {"success": True, "data": {"query": query, "total_results": 0, "message": "Результаты не найдены"}}
+                    results_response = self.session.get(
+                        f"{self.base_url}/search/results",
+                        headers={"Referer": f"{self.base_url}/search"},
+                        timeout=self.timeout,
+                    )
+                    results_response.raise_for_status()
+                    if results_response.url.rstrip("/") == f"{self.base_url}/search/results":
+                        response = results_response
+                    elif count is not None:
+                        return {"success": True, "data": {"query": query, "total_results": count, "message": "Результаты ещё обрабатываются"}}
+
+                if self._is_login_page(response):
+                    return {"success": False, "error": "Сессия Leak-Lookup истекла во время запроса"}
+
+                flat = self._parse_results(response.text, response.url, query)
+                return {"success": True, "data": flat}
+            except Exception as exc:
+                return {"success": False, "error": str(exc)}
+
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        queries = []
+        if params.get("phone") or params.get("number"):
+            phone = params.get("phone") or params.get("number")
+            queries.append(("phone", phone, normalize_phone(phone) or phone))
+        if params.get("email"):
+            queries.append(("email", params["email"], params["email"]))
+        for field, original, query in queries:
+            payload = self._search_query(str(query))
+            if not payload.get("success"):
+                results.append(_result_err("leak_lookup", field, original, payload.get("error") or "ошибка"))
+                continue
+            data = payload.get("data") or {}
+            if data.get("total_results", 0) == 0 or (data.get("message") and len(data) <= 3):
+                continue
+            results.append(_result_ok("leak_lookup", field, original, data))
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
+
+
+class ZvoniliModule(BaseSearchModule):
+    """Zvonili.com — отзывы и рейтинг по телефону"""
+
+    SUPPORTED_FIELDS = ["phone", "number"]
+    BASE_URL = "https://zvonili.com/phone/{}"
+    HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    REVIEW_CATEGORIES = {
+        "Мошенники", "Коллекторы", "Колл-центры", "Спам", "Реклама",
+        "Банк", "Опрос", "Другое", "Неадекваты",
+    }
+
+    def _parse_general_info(self, text: str) -> Dict[str, Any]:
+        info = {"rating": "", "views": 0, "total_reviews": 0}
+        rating_match = re.search(r"Рейтинг номера:\s*([\d.]+)/5", text)
+        if rating_match:
+            info["rating"] = rating_match.group(1)
+        views_match = re.search(r"Просмотров:\s*(\d+)", text)
+        if views_match:
+            info["views"] = int(views_match.group(1))
+        reviews_match = re.search(r"Отзывов:\s*(\d+)", text)
+        if reviews_match:
+            info["total_reviews"] = int(reviews_match.group(1))
+        return info
+
+    def _parse_reviews(self, full_text: str) -> List[Dict[str, Any]]:
+        reviews = []
+        reviews_start = full_text.find("Отзывы по номеру")
+        if reviews_start == -1:
+            return reviews
+        reviews_text = full_text[reviews_start:]
+        new_reviews_pos = reviews_text.find("Новые отзывы")
+        if new_reviews_pos != -1:
+            reviews_text = reviews_text[:new_reviews_pos]
+        date_pattern = re.compile(r"(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})")
+        matches = list(date_pattern.finditer(reviews_text))
+        for i, match in enumerate(matches):
+            date = match.group(1)
+            time_str = match.group(2)
+            start_pos = match.start()
+            end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(reviews_text)
+            before_date = reviews_text[max(0, start_pos - 100):start_pos].strip()
+            author_parts = before_date.split("\n")
+            author = author_parts[-1].strip() if author_parts else "Аноним"
+            author = re.sub(r"^\d+\s*", "", author).strip() or "Аноним"
+            after_date = re.sub(r"^\s*\.\.\.\s*", "", reviews_text[match.end():end_pos].strip())
+            review_text = ""
+            category = ""
+            for line in after_date.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if line in self.REVIEW_CATEGORIES:
+                    category = line
+                    continue
+                if line and not line.startswith("+7") and not line.startswith("8"):
+                    review_text += line + " "
+            review_text = review_text.strip()
+            if review_text:
+                reviews.append({
+                    "author": author,
+                    "date": date,
+                    "time": time_str,
+                    "text": review_text,
+                    "category": category,
+                })
+        return reviews
+
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        phone = params.get("phone") or params.get("number")
+        if not phone:
+            return {"success": False, "results": [], "total": 0}
+        try:
+            formatted = normalize_phone_e164(phone)
+            if len(re.sub(r"\D", "", formatted)) < 10:
+                return {"success": False, "results": [_result_err("zvonili", "phone", phone, "Номер слишком короткий")], "total": 1}
+            url = self.BASE_URL.format(formatted)
+            response = requests.get(url, headers=self.HEADERS, timeout=20)
+            if response.status_code == 404:
+                return {"success": False, "results": [], "total": 0}
+            response.raise_for_status()
+            if BeautifulSoup is not None:
+                soup = BeautifulSoup(response.text, "html.parser")
+                full_text = soup.get_text("\n", strip=True)
+                plain = soup.get_text(" ", strip=True)
+            else:
+                full_text = response.text
+                plain = re.sub(r"<[^>]+>", " ", response.text)
+            info = self._parse_general_info(plain)
+            reviews = self._parse_reviews(full_text)
+            tags = sorted({r["category"] for r in reviews if r.get("category")})
+            data = {
+                "phone": formatted,
+                "url": url,
+                "status": "found" if reviews else "no_reviews",
+                "rating": info.get("rating"),
+                "views": info.get("views"),
+                "total_reviews": info.get("total_reviews") or len(reviews),
+                "tags": tags,
+                "reviews": reviews[:30],
+            }
+            if data["status"] == "no_reviews" and not data.get("rating") and not data.get("views"):
+                return {"success": False, "results": [], "total": 0}
+            results.append(_result_ok("zvonili", "phone", phone, data))
+        except Exception as exc:
+            results.append(_result_err("zvonili", "phone", phone, exc))
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
+
+
+class SeonModule(BaseSearchModule):
+    """SEON phone-api — risk score / CNAM / carrier / registrations"""
+
+    SUPPORTED_FIELDS = ["phone", "number"]
+
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key or SEON_API_KEY
+        self.base_url = "https://api.seon.io/SeonRestService/phone-api/v2/"
+        self.headers = {"X-API-KEY": self.api_key, "Content-Type": "application/json"}
+
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        phone = params.get("phone") or params.get("number")
+        if not phone:
+            return {"success": False, "results": [], "total": 0}
+        if not self.api_key:
+            return {"success": False, "results": [_result_err("seon", "phone", phone, "SEON API key не задан")], "total": 1}
+        clean_phone = normalize_phone(phone)
+        payload = {
+            "phone": clean_phone,
+            "config": {
+                "timeout": 5000,
+                "priority_timeout": 5000,
+                "priority_sites": "",
+                "include": "cnam_lookup",
+                "flags_timeframe_days": 365,
+            },
+        }
+        try:
+            response = requests.post(self.base_url, json=payload, headers=self.headers, timeout=30)
+            if response.status_code != 200:
+                results.append(_result_err("seon", "phone", phone, f"HTTP {response.status_code}: {response.text[:300]}"))
+                return {"success": False, "results": results, "total": len(results)}
+            raw = response.json()
+            if not raw.get("success"):
+                results.append(_result_err("seon", "phone", phone, raw.get("error") or "SEON: нет данных"))
+                return {"success": False, "results": results, "total": len(results)}
+
+            payload_data = raw.get("data") or {}
+            flat: Dict[str, Any] = {"phone": clean_phone}
+            risk = payload_data.get("risk_scores") or {}
+            for key, value in risk.items():
+                flat[f"risk_{key}"] = value
+            account = payload_data.get("account_aggregates") or {}
+            if account.get("total_registration") is not None:
+                flat["total_registrations"] = account.get("total_registration")
+            personal = account.get("personal") or {}
+            if personal.get("total_registration") is not None:
+                flat["personal_registrations"] = personal.get("total_registration")
+            business = account.get("business") or {}
+            if business:
+                registered = [site for site, meta in business.items() if isinstance(meta, dict) and meta.get("registered")]
+                if registered:
+                    flat["business_sites"] = ", ".join(registered[:40])
+            cnam = payload_data.get("cnam_details") or {}
+            if cnam.get("name"):
+                flat["cnam_name"] = cnam.get("name")
+                flat["cnam_reliability"] = cnam.get("reliability")
+            carrier = payload_data.get("provider_carrier_details") or {}
+            if carrier:
+                flat["carrier"] = carrier.get("carrier")
+                flat["country"] = carrier.get("country")
+                flat["line_type"] = carrier.get("type")
+                flat["phone_valid"] = carrier.get("phone_is_valid")
+            flat = {k: v for k, v in flat.items() if v not in (None, "", [], {})}
+            if flat:
+                results.append(_result_ok("seon", "phone", phone, flat))
+        except Exception as exc:
+            results.append(_result_err("seon", "phone", phone, exc))
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
+
+
+class WhatsAppModule(BaseSearchModule):
+    """WhatsApp check via whatsapp.checkleaked.cc (опционально Playwright для login)"""
+
+    SUPPORTED_FIELDS = ["phone", "number"]
+    TIMEOUT = 12.0
+    BASE = "https://whatsapp.checkleaked.cc"
+
+    def can_handle(self, params: Dict[str, Any]) -> bool:
+        if not super().can_handle(params):
+            return False
+        # без сохранённой сессии и без WHATSAPP_AUTO_LOGIN — пропускаем
+        auth_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "whatsapp_auth.json")
+        if os.path.exists(auth_file) or os.getenv("WHATSAPP_AUTO_LOGIN", "0") == "1":
+            return True
+        return False
+
+    def __init__(self, email: str = None, password: str = None):
+        self.email = email or WHATSAPP_EMAIL
+        self.password = password or WHATSAPP_PASSWORD
+        self._lock = threading.Lock()
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        os.makedirs(data_dir, exist_ok=True)
+        self.auth_file = os.path.join(data_dir, "whatsapp_auth.json")
+
+    def _playwright_available(self) -> bool:
+        try:
+            from playwright.sync_api import sync_playwright  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def auto_login(self) -> Optional[dict]:
+        with self._lock:
+            return self._auto_login_locked()
+
+    def _auto_login_locked(self) -> Optional[dict]:
+        if not self._playwright_available():
+            logger.warning("Playwright не установлен — WhatsApp auth недоступен")
+            return None
+        if not self.email or not self.password:
+            return None
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context()
+                page = context.new_page()
+                page.goto(f"{self.BASE}/ru/79828731165", timeout=60000)
+                page.get_by_role("button", name="Пользователь").click()
+                page.locator("#v-menu-v-11").get_by_role("link", name="Войти / Регистрация").click()
+                page.get_by_role("textbox", name="Email").fill(self.email)
+                page.get_by_role("textbox", name="Пароль").fill(self.password)
+                page.get_by_role("button", name="Войти", exact=True).click()
+                page.wait_for_selector("button:has-text('Войти')", state="hidden", timeout=15000)
+                storage = context.storage_state(path=self.auth_file)
+                browser.close()
+                return storage
+        except Exception as exc:
+            logger.warning(f"WhatsApp auto_login error: {exc}")
+            return None
+
+    def get_auth(self) -> Optional[dict]:
+        if os.path.exists(self.auth_file):
+            try:
+                with open(self.auth_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        # Playwright login намеренно НЕ вызываем в hot-path поиска (60s+).
+        # Положите data/whatsapp_auth.json заранее или задайте WHATSAPP_AUTO_LOGIN=1.
+        if os.getenv("WHATSAPP_AUTO_LOGIN", "0") == "1":
+            return self.auto_login()
+        return None
+
+    def _headers_and_token(self) -> Tuple[Optional[dict], Optional[str]]:
+        auth = self.get_auth()
+        if not auth:
+            return None, None
+        token = None
+        cookie_strings = []
+        for cookie in auth.get("cookies", []):
+            if cookie.get("name") == "firebaseAuthToken":
+                token = cookie.get("value")
+            cookie_strings.append(f"{cookie['name']}={cookie['value']}")
+        if not token:
+            auth = self.auto_login()
+            if not auth:
+                return None, None
+            cookie_strings = []
+            for cookie in auth.get("cookies", []):
+                if cookie.get("name") == "firebaseAuthToken":
+                    token = cookie.get("value")
+                cookie_strings.append(f"{cookie['name']}={cookie['value']}")
+        if not token:
+            return None, None
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "ru-RU,ru;q=0.9",
+            "Authorization": f"Bearer {token}",
+            "Cookie": "; ".join(cookie_strings),
+        }
+        return headers, token
+
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        phone = params.get("phone") or params.get("number")
+        if not phone:
+            return {"success": False, "results": [], "total": 0}
+        phone_clean = normalize_phone(phone)
+        if len(phone_clean) < 10:
+            return {"success": False, "results": [_result_err("whatsapp", "phone", phone, "Неверный формат номера")], "total": 1}
+
+        headers, token = self._headers_and_token()
+        if not headers or not token:
+            return {"success": False, "results": [_result_err("whatsapp", "phone", phone, "Не удалось получить WhatsApp-сессию")], "total": 1}
+
+        headers["Referer"] = f"{self.BASE}/ru/{phone_clean}"
+        url = (
+            f"{self.BASE}/api/authenticated/phone/{phone_clean}"
+            "?googleMaps=true&websiteCheck=true&businessVerification=true"
+        )
+        try:
+            response = requests.get(url, headers=headers, timeout=12)
+            if response.status_code == 401:
+                self.auto_login()
+                headers, token = self._headers_and_token()
+                if not headers:
+                    return {"success": False, "results": [_result_err("whatsapp", "phone", phone, "Сессия WhatsApp истекла")], "total": 1}
+                headers["Referer"] = f"{self.BASE}/ru/{phone_clean}"
+                response = requests.get(url, headers=headers, timeout=12)
+            if response.status_code != 200:
+                results.append(_result_err("whatsapp", "phone", phone, f"HTTP {response.status_code}"))
+                return {"success": False, "results": results, "total": len(results)}
+            data = response.json()
+            is_wa = data.get("isWAContact", False)
+            exists = data.get("exists", False)
+            if not is_wa or not exists:
+                return {"success": False, "results": [], "total": 0}
+            phone_val = data.get("phone", phone_clean)
+            flat = {
+                "status": "found",
+                "phone": phone_val,
+                "wa_link": f"https://wa.me/+{phone_val}",
+                "is_business": data.get("isBusiness", False),
+                "is_verified": data.get("isVerified", False),
+                "is_banned": (data.get("checkMetadata") or {}).get("isBanned", False),
+                "exists": True,
+            }
+            results.append(_result_ok("whatsapp", "phone", phone, flat))
+        except requests.exceptions.Timeout:
+            results.append(_result_err("whatsapp", "phone", phone, "Сервер WhatsApp недоступен (таймаут)"))
+        except Exception as exc:
+            results.append(_result_err("whatsapp", "phone", phone, exc))
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
+
+
+class PansrcModule(BaseSearchModule):
+    """Pansrc — Telegram OSINT (id / @username)"""
+
+    SUPPORTED_FIELDS = ["telegram", "telegram_id", "username", "nick"]
+    TIMEOUT = 6.0
+
+    def __init__(self, token: str = None):
+        self.token = token or PANSRC_TOKEN
+        self.base_url = PANSRC_URL
+        self._lock = threading.Lock()
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "GloomApi/2.1"})
+
+    def _search_raw(self, query: str) -> Dict[str, Any]:
+        if not query:
+            return {"success": False, "error": "Пустой запрос"}
+        try:
+            with self._lock:
+                response = self.session.get(
+                    self.base_url,
+                    params={"q": query.strip(), "token": self.token},
+                    timeout=30,
+                )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("success") and data.get("data"):
+                    return {"success": True, "data": data["data"]}
+                return {"success": False, "error": data.get("error", "Данные не найдены")}
+            errors = {
+                401: "Требуется токен",
+                141: "Токен недействителен",
+                333: "Токен просрочен",
+                400: "Неверный формат запроса",
+                404: "Пользователь не найден",
+            }
+            return {"success": False, "error": errors.get(response.status_code, f"HTTP {response.status_code}")}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def _flatten(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        flat = {}
+        for key in ["id", "phone", "registration", "fio", "email", "address", "birth_date"]:
+            if data.get(key):
+                flat[key] = data[key]
+        if data.get("names"):
+            names = [f"{n.get('name', '')} ({n.get('date', '')})" for n in data["names"] if n.get("name")]
+            if names:
+                flat["names"] = ", ".join(names)
+        if data.get("usernames"):
+            usernames = [f"{u.get('username', '')} ({u.get('date', '')})" for u in data["usernames"] if u.get("username")]
+            if usernames:
+                flat["usernames"] = ", ".join(usernames)
+        if data.get("sent_gifts"):
+            flat["sent_gifts"] = ", ".join([str(g) for g in data["sent_gifts"][:10]])
+        if data.get("received_gifts"):
+            flat["received_gifts"] = ", ".join([str(g) for g in data["received_gifts"][:10]])
+        if data.get("groups"):
+            groups = [f"{g.get('group', '')} ({g.get('date', '')})" for g in data["groups"] if g.get("group")]
+            if groups:
+                flat["groups"] = ", ".join(groups[:10])
+        return flat
+
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        candidates = []
+        for field in ("telegram", "telegram_id", "username", "nick"):
+            value = params.get(field)
+            if not value:
+                continue
+            query = normalize_telegram_query(str(value))
+            if len(query) < 3 and not query.isdigit():
+                continue
+            candidates.append((field, value, query))
+        seen = set()
+        for field, original, query in candidates:
+            if query in seen:
+                continue
+            seen.add(query)
+            payload = self._search_raw(query)
+            if not payload.get("success"):
+                results.append(_result_err("pansrc", field, original, payload.get("error") or "ошибка"))
+                continue
+            flat = self._flatten(payload.get("data") or {})
+            if flat:
+                results.append(_result_ok("pansrc", field, original, flat))
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
+
+
+
 # ============================================================================
 # АУТЕНТИФИКАЦИЯ
 # ============================================================================
 
 security = HTTPBearer()
 
+def _secure_eq(a: Optional[str], b: Optional[str]) -> bool:
+    """Constant-time сравнение строк разной длины."""
+    if a is None or b is None:
+        return False
+    a_b, b_b = str(a).encode(), str(b).encode()
+    if len(a_b) != len(b_b):
+        # всё равно делаем фиктивное сравнение, чтобы не падать и не утекать по времени слишком явно
+        hmac.compare_digest(a_b, a_b)
+        return False
+    return hmac.compare_digest(a_b, b_b)
+
+
+def get_client_ip(request: Optional[Request]) -> str:
+    """IP клиента. X-Forwarded-For учитывается только при TRUST_PROXY=1."""
+    if request is None:
+        return ""
+    if TRUST_PROXY:
+        forwarded_for = request.headers.get("X-Forwarded-For")
+        if forwarded_for:
+            return forwarded_for.split(",")[0].strip()[:64]
+        real_ip = request.headers.get("X-Real-IP")
+        if real_ip:
+            return real_ip.strip()[:64]
+    if request.client:
+        return (request.client.host or "")[:64]
+    return ""
+
+
 def verify_admin_ip(request: Request) -> bool:
     """Проверка IP адреса для админских операций"""
     if not ADMIN_IP_WHITELIST:
-        return True  # Если whitelist не настроен, разрешаем все
-    
-    client_ip = request.client.host
-    # Проверка через X-Forwarded-For для проксированных запросов
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        client_ip = forwarded_for.split(",")[0].strip()
-    
+        return True
+    client_ip = get_client_ip(request)
     return client_ip in ADMIN_IP_WHITELIST
 
-def get_master_api_key(credentials: HTTPAuthorizationCredentials = Depends(security), request: Request = None):
+
+def hash_key(key: str) -> str:
+    """Хеширование ключа для безопасного хранения"""
+    return hashlib.sha256(str(key).encode("utf-8")).hexdigest()
+
+
+def verify_ip_restrictions(api_key: APIKey, client_ip: str) -> bool:
+    """Проверка IP ограничений ключа"""
+    if not api_key.ip_restrictions:
+        return True
+    try:
+        allowed_ips = json.loads(api_key.ip_restrictions)
+        if not isinstance(allowed_ips, list):
+            return False
+        return client_ip in allowed_ips or "*" in allowed_ips
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def reserve_search_slot(db: Session, api_key_id: int) -> Optional[APIKey]:
+    """Атомарно резервирует слот поиска (защита от гонок по search_limit)."""
+    now = datetime.utcnow()
+    stmt = (
+        update(APIKey)
+        .where(APIKey.id == api_key_id)
+        .where(APIKey.status == "active")
+        .where((APIKey.expires_at.is_(None)) | (APIKey.expires_at > now))
+        .where(
+            (APIKey.search_limit.is_(None))
+            | (APIKey.searches_used < APIKey.search_limit)
+        )
+        .values(
+            searches_used=APIKey.searches_used + 1,
+            last_used_at=now,
+        )
+    )
+    result = db.execute(stmt)
+    if result.rowcount != 1:
+        db.rollback()
+        return None
+    db.commit()
+    return db.query(APIKey).filter(APIKey.id == api_key_id).first()
+
+
+def refund_search_slot(db: Session, api_key_id: int) -> None:
+    """Возврат слота при критическом сбое до получения результата."""
+    try:
+        db.execute(
+            update(APIKey)
+            .where(APIKey.id == api_key_id)
+            .where(APIKey.searches_used > 0)
+            .values(searches_used=APIKey.searches_used - 1)
+        )
+        db.commit()
+    except Exception as exc:
+        logger.warning("refund_search_slot failed: %s", exc)
+        db.rollback()
+
+
+def sanitize_params_for_log(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Маскирует чувствительные поля перед записью в SearchLog."""
+    out = {}
+    for k, v in params.items():
+        if k in ("password", "card", "passport", "snils"):
+            s = str(v)
+            out[k] = ("*" * min(8, len(s))) if s else None
+        else:
+            out[k] = v
+    return out
+
+
+def safe_output_path(filename: Optional[str]) -> Optional[str]:
+    """Разрешает запись только внутри OUTPUT_DIR (anti path-traversal)."""
+    if not filename:
+        return None
+    raw = str(filename).strip()
+    # любые попытки обхода директорий — отказ
+    if ".." in raw or "/" in raw or "\\" in raw or raw.startswith("."):
+        return None
+    name = os.path.basename(raw)
+    if not name or name in (".", ".."):
+        return None
+    if not re.match(r"^[A-Za-z0-9._-]{1,200}\.json$", name):
+        if re.match(r"^[A-Za-z0-9._-]{1,200}$", name):
+            name = name + ".json"
+        else:
+            return None
+    full = os.path.abspath(os.path.join(OUTPUT_DIR, name))
+    out_root = os.path.abspath(OUTPUT_DIR)
+    if not full.startswith(out_root + os.sep):
+        return None
+    return full
+
+
+def get_master_api_key(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
     """Аутентификация для админских операций через MASTER_API_KEY"""
     if not MASTER_API_KEY:
         raise HTTPException(
-            status_code=500, 
-            detail="MASTER_API_KEY не настроен в переменных окружения"
+            status_code=500,
+            detail="MASTER_API_KEY не настроен в переменных окружения",
         )
-    
+
     token = credentials.credentials
-    
-    if token != MASTER_API_KEY:
+    if not _secure_eq(token, MASTER_API_KEY):
         raise HTTPException(status_code=401, detail="Неверный мастер-ключ")
-    
-    # Проверка IP whitelist
-    if request and not verify_admin_ip(request):
-        raise HTTPException(
-            status_code=403, 
-            detail=f"IP адрес {request.client.host} не в белом списке"
-        )
-    
+
+    if not verify_admin_ip(request):
+        raise HTTPException(status_code=403, detail="IP адрес не в белом списке")
+
     return True
 
-def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db), request: Request = None):
-    token = credentials.credentials
+
+def get_api_key(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+):
+    token = credentials.credentials or ""
+    if len(token) < 16 or len(token) > 256:
+        raise HTTPException(status_code=401, detail="Неверный ключ")
+
     key_hash = hash_key(token)
     api_key = db.query(APIKey).filter(APIKey.key_hash == key_hash).first()
-    
-    if not api_key:
+    if not api_key or not _secure_eq(api_key.key, token):
         raise HTTPException(status_code=401, detail="Неверный ключ")
-    
-    # Проверка по оригинальному ключу для обратной совместимости
-    if api_key.key != token:
-        raise HTTPException(status_code=401, detail="Неверный ключ")
-    
+
     if not api_key.is_valid:
         raise HTTPException(status_code=401, detail="Ключ недействителен или истёк")
-    
-    # Проверка IP ограничений
-    if request:
-        client_ip = request.client.host
-        if not verify_ip_restrictions(api_key, client_ip):
-            raise HTTPException(status_code=403, detail="IP адрес не разрешён")
-    
-    # Обновление времени последнего использования
-    api_key.last_used_at = datetime.utcnow()
-    db.commit()
-    
+
+    client_ip = get_client_ip(request)
+    if not verify_ip_restrictions(api_key, client_ip):
+        raise HTTPException(status_code=403, detail="IP адрес не разрешён")
+
+    # last_used обновляется атомарно в reserve_search_slot при /search
     return api_key
 
 # ============================================================================
@@ -2835,70 +4091,106 @@ bot_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan context manager для управления ботом"""
+    """Lifespan: DB init, bot start, graceful shutdown."""
     global bot_manager, bot_task
-    # Startup
     init_db()
-    
     if TELEGRAM_BOT_TOKEN:
         bot_manager = TelegramBotManager()
         bot_task = asyncio.create_task(bot_manager.run_async())
-    
-    yield
-    
-    # Shutdown
-    if bot_task:
-        bot_task.cancel()
+    try:
+        yield
+    finally:
+        if bot_task:
+            bot_task.cancel()
+            try:
+                await bot_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning("bot shutdown error: %s", exc)
         try:
-            await bot_task
-        except asyncio.CancelledError:
+            SEARCH_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            SEARCH_EXECUTOR.shutdown(wait=False)
+        except Exception as exc:
+            logger.warning("executor shutdown error: %s", exc)
+        try:
+            HTTP_SESSION.close()
+        except Exception:
             pass
 
-app = FastAPI(title="GloomApi - Search API", version="2.0", lifespan=lifespan)
+app = FastAPI(title="GloomApi - Search API", version="2.1", lifespan=lifespan)
 
-# CORS
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("unhandled: %s", exc)
+    return JSONResponse(status_code=500, content={"error": "Internal server error"})
+
+
+# CORS: credentials + "*" несовместимы — при пустом ALLOWED_ORIGINS credentials выключаем
+_cors_origins = ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"]
+_cors_credentials = bool(ALLOWED_ORIGINS)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_credentials,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
+    max_age=600,
 )
 
-# Rate Limiting Middleware
+
 @app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    """Apply rate limiting to all requests"""
-    # Get client identifier (IP address)
-    client_ip = request.client.host
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        client_ip = forwarded_for.split(",")[0].strip()
-    
-    # Skip rate limiting for admin endpoints with valid master key
-    if request.url.path.startswith("/key") or request.url.path.startswith("/keys") or request.url.path == "/stats":
-        auth_header = request.headers.get("Authorization")
-        if auth_header and auth_header.startswith("Bearer "):
-            token = auth_header.replace("Bearer ", "")
-            if token == MASTER_API_KEY:
-                return await call_next(request)
-    
-    # Apply rate limiting
+async def security_and_rate_limit_middleware(request: Request, call_next):
+    """Rate limit + базовые security headers."""
+    client_ip = get_client_ip(request) or "unknown"
+
+    # admin bypass only with valid master key (constant-time)
+    path = request.url.path
+    if path.startswith("/key") or path.startswith("/keys") or path == "/stats":
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer ") and MASTER_API_KEY:
+            token = auth_header[7:].strip()
+            if _secure_eq(token, MASTER_API_KEY):
+                response = await call_next(request)
+                _set_security_headers(response)
+                return response
+
     if not rate_limiter.is_allowed(client_ip):
         remaining = rate_limiter.get_remaining(client_ip)
-        return JSONResponse(
+        resp = JSONResponse(
             status_code=429,
             content={
                 "error": "Rate limit exceeded",
                 "remaining": remaining,
                 "limit": RATE_LIMIT_REQUESTS,
-                "period": RATE_LIMIT_PERIOD
-            }
+                "period": RATE_LIMIT_PERIOD,
+            },
         )
-    
-    response = await call_next(request)
+        _set_security_headers(resp)
+        resp.headers["Retry-After"] = str(RATE_LIMIT_PERIOD)
+        return resp
+
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        logger.exception("unhandled request error: %s", exc)
+        response = JSONResponse(status_code=500, content={"error": "Internal server error"})
+    _set_security_headers(response)
     response.headers["X-RateLimit-Remaining"] = str(rate_limiter.get_remaining(client_ip))
     return response
+
+
+def _set_security_headers(response: Response) -> None:
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Cache-Control", "no-store")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
 
 # Инициализация всех поисковых модулей
 search_modules = [
@@ -2910,6 +4202,11 @@ search_modules = [
     VKAPIModule(),
     TruecallerModule(),
     InfinitySearchModule(),
+    LeakLookupModule(),
+    ZvoniliModule(),
+    SeonModule(),
+    WhatsAppModule(),
+    PansrcModule(),
     FaceSearchModule(),
     DeepScanModule(),
     BigBaseModule(),
@@ -2949,95 +4246,240 @@ search_modules = [
     W2SP3RModule(),
     QuickFlowModule(),
     FunStatModule(),
-    GerhanoModule()
+    GerhanoModule(),
 ]
 
 # ============================================================================
 # ENDPOINTS
 # ============================================================================
 
-@app.post("/search")
-async def search(request: SearchRequest, api_key: APIKey = Depends(get_api_key), db: Session = Depends(get_db)):
-    params = {k: v for k, v in request.dict().items() if v is not None}
+def _normalize_search_params(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Нормализация, clamp длины и обогащение параметров поиска."""
+    params: Dict[str, Any] = {}
+    for k, v in raw.items():
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        if len(s) > MAX_QUERY_VALUE_LEN:
+            s = s[:MAX_QUERY_VALUE_LEN]
+        params[k] = s
+
     output_file = params.pop("output_file", None)
-    
-    # Combine first_name and last_name into fio if both are provided but fio is not
+
+    if "number" in params and "phone" not in params:
+        params["phone"] = params["number"]
+
     if "first_name" in params and "last_name" in params and "fio" not in params and "fullname" not in params:
-        params["fio"] = f"{params['first_name']} {params['last_name']}"
-    
-    # Also handle case where only one of first_name/last_name is provided - use it as name
+        params["fio"] = f"{params['first_name']} {params['last_name']}".strip()
     if "first_name" in params and "last_name" not in params and "fio" not in params and "fullname" not in params and "name" not in params:
         params["fio"] = params["first_name"]
     if "last_name" in params and "first_name" not in params and "fio" not in params and "fullname" not in params and "name" not in params:
         params["fio"] = params["last_name"]
-    
+
+    if params.get("phone"):
+        params["phone"] = normalize_phone(params["phone"]) or params["phone"]
+    if params.get("vk") or params.get("vk_id"):
+        raw_vk = params.get("vk") or params.get("vk_id")
+        params["vk"] = extract_vk_id(raw_vk)
+        params["vk_id"] = params["vk"]
+    if params.get("telegram") or params.get("telegram_id") or params.get("username"):
+        tg = params.get("telegram") or params.get("telegram_id") or params.get("username")
+        params["telegram"] = normalize_telegram_query(str(tg))
+
+    return params, output_file
+
+
+def _result_fingerprint(row: Dict[str, Any]) -> str:
+    """Стабильный ключ дедупликации результатов."""
+    try:
+        payload = {
+            "source": row.get("source"),
+            "field": row.get("field"),
+            "value": row.get("value"),
+            "method": row.get("method"),
+            "data": row.get("data"),
+        }
+        blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        blob = f"{row.get('source')}|{row.get('field')}|{row.get('value')}"
+    return hashlib.sha1(blob.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _dedupe_results(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        fp = _result_fingerprint(row)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        out.append(row)
+        if len(out) >= MAX_SEARCH_RESULTS:
+            break
+    return out
+
+
+def _run_single_module(module: BaseSearchModule, params: Dict[str, Any]) -> Dict[str, Any]:
+    name = module.__class__.__name__
+    try:
+        if hasattr(module, "can_handle") and not module.can_handle(params):
+            reason = "disabled_or_circuit" if not getattr(module, "ENABLED", True) else "unsupported_fields"
+            if not circuit_breaker.allow(name):
+                reason = "circuit_open"
+            return {"success": False, "results": [], "skipped": True, "module": name, "reason": reason}
+        started = time()
+        result = module.search(params) or {"success": False, "results": []}
+        result["module"] = name
+        result["elapsed_ms"] = int((time() - started) * 1000)
+        return result
+    except Exception as exc:
+        circuit_breaker.failure(name)
+        logger.warning("%s failed: %s", name, exc)
+        return {"success": False, "module": name, "results": [], "error": str(exc)}
+
+
+async def run_search_modules_parallel(params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Параллельный запуск только релевантных модулей с общим таймаутом."""
+    loop = asyncio.get_running_loop()
+    to_run: List[BaseSearchModule] = []
+    skipped_pre: List[Dict[str, str]] = []
+    for module in search_modules:
+        name = module.__class__.__name__
+        if not getattr(module, "ENABLED", True):
+            skipped_pre.append({"module": name, "reason": "disabled"})
+            continue
+        if not circuit_breaker.allow(name):
+            skipped_pre.append({"module": name, "reason": "circuit_open"})
+            continue
+        if hasattr(module, "can_handle") and not module.can_handle(params):
+            skipped_pre.append({"module": name, "reason": "unsupported_fields"})
+            continue
+        to_run.append(module)
+
+    meta = {
+        "modules_total": len(search_modules),
+        "modules_scheduled": len(to_run),
+        "modules_ran": 0,
+        "modules_skipped": len(skipped_pre),
+        "modules_with_hits": 0,
+        "elapsed_by_module": {},
+        "skipped": skipped_pre[:80],
+    }
+    if not to_run:
+        return [], meta
+
+    futures = [
+        loop.run_in_executor(SEARCH_EXECUTOR, _run_single_module, module, params)
+        for module in to_run
+    ]
+    try:
+        gathered = await asyncio.wait_for(
+            asyncio.gather(*futures, return_exceptions=True),
+            timeout=SEARCH_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Search timed out after %ss", SEARCH_TIMEOUT_SEC)
+        return [], {**meta, "timeout": True, "timeout_sec": SEARCH_TIMEOUT_SEC}
+
+    all_results: List[Dict[str, Any]] = []
+    for item in gathered:
+        if isinstance(item, Exception):
+            logger.warning("module exception: %s", item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        name = item.get("module") or "?"
+        if item.get("elapsed_ms") is not None:
+            meta["elapsed_by_module"][name] = item["elapsed_ms"]
+        if item.get("skipped"):
+            meta["modules_skipped"] += 1
+            if len(meta["skipped"]) < 80:
+                meta["skipped"].append({"module": name, "reason": item.get("reason")})
+            continue
+        meta["modules_ran"] += 1
+        hits = [row for row in (item.get("results") or []) if row.get("found")]
+        if hits:
+            meta["modules_with_hits"] += 1
+            all_results.extend(hits)
+        elif item.get("error"):
+            logger.debug("%s: %s", name, item.get("error"))
+
+    deduped = _dedupe_results(all_results)
+    meta["deduped_from"] = len(all_results)
+    meta["deduped_to"] = len(deduped)
+    return deduped, meta
+
+
+@app.post("/search")
+async def search(request: SearchRequest, api_key: APIKey = Depends(get_api_key), db: Session = Depends(get_db)):
+    raw = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+    params, output_file = _normalize_search_params(raw)
+
     if not params:
         raise HTTPException(status_code=400, detail="Укажите хотя бы один параметр")
-    
-    # Поиск по всем модулям
-    all_results = []
-    source_api_keys = set()  # Track which API keys were used
-    
-    for module in search_modules:
-        try:
-            result = module.search(params)
-            if result.get("success"):
-                results = result.get("results", [])
-                all_results.extend(results)
-                # Extract API keys used from results
-                for r in results:
-                    if "api_key" in r:
-                        source_api_keys.add(r["api_key"])
-        except Exception as e:
-            all_results.append({
-                "source": module.__class__.__name__,
-                "error": str(e),
-                "found": False
-            })
-    
-    # Логирование
-    api_key.searches_used += 1
-    source_api_key_str = ", ".join(source_api_keys) if source_api_keys else None
-    db.add(SearchLog(
-        api_key_id=api_key.id, 
-        search_params=json.dumps(params), 
-        results_count=len(all_results),
-        source_api_key=source_api_key_str
-    ))
-    db.commit()
-    
+
+    # атомарный резерв слота ДО тяжёлой работы
+    reserved = reserve_search_slot(db, api_key.id)
+    if reserved is None:
+        raise HTTPException(status_code=401, detail="Ключ недействителен или лимит исчерпан")
+
+    try:
+        all_results, search_meta = await run_search_modules_parallel(params)
+    except Exception as exc:
+        logger.exception("search orchestration failed: %s", exc)
+        refund_search_slot(db, api_key.id)
+        raise HTTPException(status_code=500, detail="Ошибка выполнения поиска")
+
+    source_api_keys = set()
+    for r in all_results:
+        if r.get("api_key"):
+            source_api_keys.add(r["api_key"])
+
+    source_api_key_str = ", ".join(sorted(source_api_keys)) if source_api_keys else None
+    try:
+        db.add(SearchLog(
+            api_key_id=api_key.id,
+            search_params=json.dumps(sanitize_params_for_log(params), ensure_ascii=False),
+            results_count=len(all_results),
+            source_api_key=source_api_key_str,
+        ))
+        db.commit()
+    except Exception as exc:
+        logger.warning("SearchLog write failed: %s", exc)
+        db.rollback()
+
+    # не отдаём password в query_params клиенту
+    public_params = sanitize_params_for_log(params)
+    sources = sorted({str(r.get("source")) for r in all_results if r.get("source")})
     response_data = {
         "success": len(all_results) > 0,
         "results": all_results,
         "total": len(all_results),
-        "timestamp": datetime.utcnow().isoformat(),
-        "query_params": params
+        "sources": sources,
+        "sources_count": len(sources),
+        "meta": search_meta,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "query_params": public_params,
+        "quota": {
+            "searches_used": reserved.searches_used,
+            "search_limit": reserved.search_limit,
+        },
     }
-    
-    # Сохранение в файл если указан
-    if output_file:
+
+    safe_path = safe_output_path(output_file)
+    if output_file and not safe_path:
+        response_data["save_error"] = "Недопустимый output_file (только имя *.json в OUTPUT_DIR)"
+    elif safe_path:
         try:
-            with open(output_file, "w", encoding="utf-8") as f:
+            with open(safe_path, "w", encoding="utf-8") as f:
                 json.dump(response_data, f, ensure_ascii=False, indent=2)
-            response_data["saved_to"] = output_file
+            response_data["saved_to"] = os.path.basename(safe_path)
         except Exception as e:
-            response_data["save_error"] = str(e)
-    
+            response_data["save_error"] = "Не удалось сохранить файл"
+
     return response_data
-
-def hash_key(key: str) -> str:
-    """Хеширование ключа для безопасного хранения"""
-    return hashlib.sha256(key.encode()).hexdigest()
-
-def verify_ip_restrictions(api_key: APIKey, client_ip: str) -> bool:
-    """Проверка IP ограничений"""
-    if not api_key.ip_restrictions:
-        return True
-    try:
-        allowed_ips = json.loads(api_key.ip_restrictions)
-        return client_ip in allowed_ips or "*" in allowed_ips
-    except:
-        return True
 
 @app.post("/key")
 async def create_key(request: CreateKeyRequest, db: Session = Depends(get_db), authenticated: bool = Depends(get_master_api_key)):
@@ -3057,7 +4499,18 @@ async def create_key(request: CreateKeyRequest, db: Session = Depends(get_db), a
     db.add(api_key)
     db.commit()
     db.refresh(api_key)
-    return api_key
+    # полный ключ отдаём только один раз при создании; hash наружу не отдаём
+    return {
+        "id": api_key.id,
+        "key": api_key.key,
+        "name": api_key.name,
+        "created_at": api_key.created_at,
+        "expires_at": api_key.expires_at,
+        "search_limit": api_key.search_limit,
+        "searches_used": api_key.searches_used,
+        "status": api_key.status,
+        "ip_restrictions": request.ip_restrictions,
+    }
 
 @app.get("/keys")
 async def list_keys(db: Session = Depends(get_db), authenticated: bool = Depends(get_master_api_key)):
@@ -3068,7 +4521,7 @@ async def list_keys(db: Session = Depends(get_db), authenticated: bool = Depends
         key_dict = {
             "id": key.id,
             "name": key.name,
-            "key": f"sk_{key.key[:8]}...{key.key[-4:]}",
+            "key": (key.key[:12] + "..." + key.key[-4:]) if key.key and len(key.key) > 20 else "***",
             "created_at": key.created_at,
             "expires_at": key.expires_at,
             "search_limit": key.search_limit,
@@ -3125,17 +4578,23 @@ async def get_stats(db: Session = Depends(get_db), authenticated: bool = Depends
 
 @app.get("/")
 async def root():
+    module_names = [m.__class__.__name__ for m in search_modules]
+    enabled = [m.__class__.__name__ for m in search_modules if getattr(m, "ENABLED", True)]
     return {
         "name": "GloomApi - Search API",
-        "version": "2.0",
+        "version": "2.1",
         "docs": "/docs",
+        "modules_count": len(module_names),
+        "modules_enabled": len(enabled),
+        "modules": module_names,
+        "enabled_modules": enabled,
         "endpoints": {
-            "/search": "POST - поиск",
-            "/key": "POST - создать ключ",
-            "/keys": "GET - список ключей",
-            "/key/{id}": "GET - информация о ключе",
-            "/stats": "GET - статистика"
-        }
+            "/search": "POST - параллельный поиск по всем источникам",
+            "/key": "POST - создать ключ (master)",
+            "/keys": "GET - список ключей (master)",
+            "/key/{id}": "GET/DELETE - ключ (master)",
+            "/stats": "GET - статистика (master)",
+        },
     }
 
 # ============================================================================
