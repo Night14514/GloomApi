@@ -18,7 +18,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFi
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, ForeignKey, update, or_
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, ForeignKey, update, or_, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from sqlalchemy.sql import func
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -42,6 +42,7 @@ import threading
 import hmac
 import base64
 import html
+import ipaddress
 from dotenv import load_dotenv
 
 try:
@@ -75,7 +76,8 @@ ADMIN_IP_WHITELIST = [ip.strip() for ip in os.getenv("ADMIN_IP_WHITELIST", "").s
 ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "").split(",") if origin.strip()]
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
 RATE_LIMIT_PERIOD = int(os.getenv("RATE_LIMIT_PERIOD", "60"))
-TRUST_PROXY = os.getenv("TRUST_PROXY", "0") == "1"
+_default_trust_proxy = "1" if os.path.exists("/data") else "0"
+TRUST_PROXY = os.getenv("TRUST_PROXY", _default_trust_proxy) == "1"
 MAX_QUERY_VALUE_LEN = int(os.getenv("MAX_QUERY_VALUE_LEN", "500"))
 MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "500"))
 OUTPUT_DIR = os.getenv(
@@ -217,11 +219,43 @@ class SearchLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     api_key = relationship("APIKey", back_populates="search_logs")
     source_api_key = Column(Text, nullable=True)  # Which API key was used for the search (e.g., jitler key)
+    client_ip = Column(String(64), nullable=True, index=True)
+    client_city = Column(String(128), nullable=True)
+    client_region = Column(String(128), nullable=True)
+    client_country = Column(String(128), nullable=True)
 
 # Создание таблиц (отложено до запуска приложения)
 def init_db():
     """Инициализация базы данных"""
     Base.metadata.create_all(bind=engine)
+    _migrate_schema()
+
+
+def _migrate_schema() -> None:
+    """Добавляет новые колонки в уже существующие SQLite/Postgres таблицы."""
+    wanted = {
+        "search_logs": {
+            "client_ip": "VARCHAR(64)",
+            "client_city": "VARCHAR(128)",
+            "client_region": "VARCHAR(128)",
+            "client_country": "VARCHAR(128)",
+        }
+    }
+    try:
+        insp = inspect(engine)
+        tables = set(insp.get_table_names())
+        for table, columns in wanted.items():
+            if table not in tables:
+                continue
+            existing = {col["name"] for col in insp.get_columns(table)}
+            for name, coltype in columns.items():
+                if name in existing:
+                    continue
+                with engine.begin() as conn:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {coltype}"))
+                logger.info("schema: added %s.%s", table, name)
+    except Exception as exc:
+        logger.warning("schema migrate skipped: %s", exc)
 
 # ============================================================================
 # МОДЕЛИ
@@ -4143,6 +4177,159 @@ def get_client_ip(request: Optional[Request]) -> str:
     return ""
 
 
+_GEO_CACHE: Dict[str, Tuple[float, Dict[str, str]]] = {}
+_GEO_CACHE_LOCK = threading.Lock()
+_GEO_CACHE_TTL = 24 * 3600
+_GEO_CACHE_FAIL_TTL = 10 * 60
+_GEO_CACHE_MAX = 2048
+
+
+def _is_public_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
+        return not (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_reserved
+            or addr.is_multicast
+            or addr.is_link_local
+            or addr.is_unspecified
+        )
+    except ValueError:
+        return False
+
+
+def _geo_cache_get(ip: str) -> Optional[Dict[str, str]]:
+    now = time()
+    with _GEO_CACHE_LOCK:
+        hit = _GEO_CACHE.get(ip)
+        if not hit:
+            return None
+        ts, data = hit
+        ttl = _GEO_CACHE_TTL if data.get("city") or data.get("country") else _GEO_CACHE_FAIL_TTL
+        if now - ts > ttl:
+            _GEO_CACHE.pop(ip, None)
+            return None
+        return dict(data)
+
+
+def _geo_cache_set(ip: str, data: Dict[str, str]) -> None:
+    with _GEO_CACHE_LOCK:
+        if len(_GEO_CACHE) >= _GEO_CACHE_MAX:
+            oldest = sorted(_GEO_CACHE.items(), key=lambda kv: kv[1][0])[: max(1, _GEO_CACHE_MAX // 10)]
+            for key, _ in oldest:
+                _GEO_CACHE.pop(key, None)
+        _GEO_CACHE[ip] = (time(), dict(data))
+
+
+def format_place(city: str = "", region: str = "", country: str = "") -> str:
+    parts: List[str] = []
+    for item in (city, region, country):
+        val = (item or "").strip()
+        if val and not any(val.lower() == p.lower() for p in parts):
+            parts.append(val)
+    return ", ".join(parts)
+
+
+def format_geo_label(ip: str, city: str = "", region: str = "", country: str = "") -> str:
+    place = format_place(city, region, country)
+    ip = (ip or "").strip()
+    if place and ip:
+        return f"{place} ({ip})"
+    return place or ip or "неизвестно"
+
+
+def _geo_http_json(url: str, params: Optional[dict] = None) -> Optional[dict]:
+    try:
+        response = HTTP_SESSION.get(url, params=params, timeout=2.5)
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _pick_geo_fields(data: dict, city_keys: Tuple[str, ...], region_keys: Tuple[str, ...], country_keys: Tuple[str, ...]) -> Dict[str, str]:
+    def first(keys: Tuple[str, ...]) -> str:
+        for key in keys:
+            val = data.get(key)
+            if val not in (None, "", [], {}):
+                return str(val).strip()[:128]
+        return ""
+    return {
+        "city": first(city_keys),
+        "region": first(region_keys),
+        "country": first(country_keys),
+    }
+
+
+def lookup_client_geo(ip: str) -> Dict[str, str]:
+    """Город/регион/страна клиента по IP через цепочку geo-API."""
+    ip = (ip or "").strip()[:64]
+    empty = {"ip": ip, "city": "", "region": "", "country": "", "label": "IP неизвестен"}
+    if not ip:
+        return empty
+    if not _is_public_ip(ip):
+        return {
+            "ip": ip,
+            "city": "локальная сеть",
+            "region": "",
+            "country": "",
+            "label": format_geo_label(ip, "локальная сеть"),
+        }
+    cached = _geo_cache_get(ip)
+    if cached:
+        return cached
+
+    sources = (
+        lambda: _pick_geo_fields(
+            _geo_http_json(f"https://ipinfo.io/{ip}/json", {"token": IPINFO_API_KEY}) or {},
+            ("city",), ("region",), ("country", "country_name"),
+        ),
+        lambda: _pick_geo_fields(
+            _geo_http_json("https://api.ipgeolocation.io/ipgeo", {"apiKey": IPGEOLOCATION_API_KEY, "ip": ip}) or {},
+            ("city",), ("state_prov", "district"), ("country_name", "country"),
+        ),
+        lambda: _pick_geo_fields(
+            _geo_http_json(f"http://api.ipstack.com/{ip}", {"access_key": IPSTACK_API_KEY}) or {},
+            ("city",), ("region_name",), ("country_name", "country_code"),
+        ),
+        lambda: _pick_geo_fields(
+            _geo_http_json(f"http://ip-api.com/json/{ip}", {"lang": "ru", "fields": "status,country,regionName,city,query"}) or {},
+            ("city",), ("regionName", "region"), ("country",),
+        ),
+    )
+    result = {"ip": ip, "city": "", "region": "", "country": "", "label": ip}
+    for fetch in sources:
+        try:
+            parsed = fetch()
+        except Exception:
+            continue
+        if not parsed:
+            continue
+        if parsed.get("city") or parsed.get("country"):
+            result["city"] = parsed.get("city") or ""
+            result["region"] = parsed.get("region") or ""
+            result["country"] = parsed.get("country") or ""
+            result["label"] = format_geo_label(ip, result["city"], result["region"], result["country"])
+            break
+    if not result.get("city") and not result.get("country"):
+        result["label"] = f"{ip} (город не определён)"
+    _geo_cache_set(ip, result)
+    return result
+
+
+def format_log_place(log: Optional["SearchLog"]) -> str:
+    if log is None:
+        return ""
+    return format_place(
+        getattr(log, "client_city", None) or "",
+        getattr(log, "client_region", None) or "",
+        getattr(log, "client_country", None) or "",
+    )
+
+
 def verify_admin_ip(request: Request) -> bool:
     """Проверка IP адреса для админских операций"""
     if not ADMIN_IP_WHITELIST:
@@ -4191,6 +4378,115 @@ def _parse_iso_dt(value: Any) -> Optional[datetime]:
             except ValueError:
                 continue
     return None
+
+
+def collect_usage_report(db: Session, logs_limit: int = 10000) -> Dict[str, Any]:
+    """Сводка использования всех ключей: IP, город, история запросов."""
+    keys = db.query(APIKey).order_by(APIKey.id.asc()).all()
+    logs = (
+        db.query(SearchLog)
+        .order_by(SearchLog.created_at.desc())
+        .limit(max(1, int(logs_limit)))
+        .all()
+    )
+    by_key: Dict[int, List[SearchLog]] = defaultdict(list)
+    for log in logs:
+        by_key[log.api_key_id].append(log)
+
+    key_blocks = []
+    total_logged = 0
+    for key in keys:
+        key_logs = by_key.get(key.id) or []
+        total_logged += len(key_logs)
+        last = key_logs[0] if key_logs else None
+        ips: List[str] = []
+        places: List[str] = []
+        seen_ip = set()
+        seen_place = set()
+        recent = []
+        for log in key_logs:
+            ip = (getattr(log, "client_ip", None) or "").strip()
+            place = format_log_place(log)
+            if ip and ip not in seen_ip:
+                seen_ip.add(ip)
+                ips.append(ip)
+            if place and place not in seen_place:
+                seen_place.add(place)
+                places.append(place)
+            try:
+                params = json.loads(log.search_params or "{}")
+            except (TypeError, json.JSONDecodeError):
+                params = {}
+            recent.append({
+                "at": _dt_to_iso(log.created_at),
+                "ip": ip or None,
+                "city": getattr(log, "client_city", None),
+                "region": getattr(log, "client_region", None),
+                "country": getattr(log, "client_country", None),
+                "place": place or None,
+                "results": log.results_count,
+                "params": list(params.keys()) if isinstance(params, dict) else [],
+            })
+        key_blocks.append({
+            "id": key.id,
+            "name": key.name,
+            "key": key.key,
+            "status": key.status,
+            "searches_used": key.searches_used or 0,
+            "search_limit": key.search_limit,
+            "last_used_at": _dt_to_iso(key.last_used_at),
+            "last_ip": getattr(last, "client_ip", None) if last else None,
+            "last_place": format_log_place(last) if last else None,
+            "unique_ips": ips,
+            "unique_places": places,
+            "recent": recent,
+        })
+    return {
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "total_keys": len(keys),
+        "active_keys": sum(1 for k in keys if k.status == "active"),
+        "total_searches": int(sum(k.searches_used or 0 for k in keys)),
+        "logged_events": total_logged,
+        "keys": key_blocks,
+    }
+
+
+def render_usage_report_text(report: Dict[str, Any]) -> str:
+    lines = [
+        "GloomApi — статистика использования ключей",
+        f"Экспорт: {report.get('exported_at')}",
+        f"Ключей: {report.get('total_keys')} (активных: {report.get('active_keys')})",
+        f"Поисков: {report.get('total_searches')}",
+        f"Записей в логах: {report.get('logged_events')}",
+        "",
+    ]
+    for block in report.get("keys") or []:
+        limit = block.get("search_limit")
+        used = block.get("searches_used") or 0
+        quota = f"{used}/{limit}" if limit else f"{used}/∞"
+        lines.append(f"=== {block.get('name')} (id={block.get('id')}) ===")
+        lines.append(f"Ключ: {block.get('key')}")
+        lines.append(f"Статус: {block.get('status')} | Использовано: {quota}")
+        last_ip = block.get("last_ip") or "нет данных"
+        last_place = block.get("last_place") or "город не определён"
+        lines.append(f"Последний IP: {last_ip}")
+        lines.append(f"Последний город: {last_place}")
+        if block.get("unique_ips"):
+            lines.append("IP: " + ", ".join(block["unique_ips"]))
+        if block.get("unique_places"):
+            lines.append("Города: " + ", ".join(block["unique_places"]))
+        recent = block.get("recent") or []
+        if not recent:
+            lines.append("Запросов пока нет.")
+        else:
+            for row in recent:
+                at = row.get("at") or "?"
+                ip = row.get("ip") or "IP неизвестен"
+                place = row.get("place") or "город не определён"
+                params = ", ".join(row.get("params") or []) or "-"
+                lines.append(f"  [{at}] IP={ip} | Город={place} | params={params} | results={row.get('results')}")
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
 
 
 def serialize_api_key(key: APIKey) -> Dict[str, Any]:
@@ -4842,16 +5138,25 @@ async def run_search_modules_parallel(params: Dict[str, Any]) -> Tuple[List[Dict
 
 
 @app.post("/search")
-async def search(request: SearchRequest, api_key: APIKey = Depends(get_api_key), db: Session = Depends(get_db)):
-    raw = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+async def search(
+    payload: SearchRequest,
+    request: Request,
+    api_key: APIKey = Depends(get_api_key),
+    db: Session = Depends(get_db),
+):
+    raw = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
     params, output_file = _normalize_search_params(raw)
 
     if not params:
         raise HTTPException(status_code=400, detail="Укажите хотя бы один параметр")
 
+    client_ip = get_client_ip(request)
+    geo_task = asyncio.get_running_loop().run_in_executor(SEARCH_EXECUTOR, lookup_client_geo, client_ip)
+
     # атомарный резерв слота ДО тяжёлой работы
     reserved = reserve_search_slot(db, api_key.id)
     if reserved is None:
+        geo_task.cancel()
         raise HTTPException(status_code=401, detail="Ключ недействителен или лимит исчерпан")
 
     try:
@@ -4860,6 +5165,16 @@ async def search(request: SearchRequest, api_key: APIKey = Depends(get_api_key),
         logger.exception("search orchestration failed: %s", exc)
         refund_search_slot(db, api_key.id)
         raise HTTPException(status_code=500, detail="Ошибка выполнения поиска")
+
+    geo = {"ip": client_ip, "city": "", "region": "", "country": ""}
+    try:
+        geo = await asyncio.wait_for(geo_task, timeout=8)
+    except Exception as exc:
+        logger.debug("geo lookup skipped: %s", exc)
+        try:
+            geo_task.cancel()
+        except Exception:
+            pass
 
     source_api_keys = set()
     for r in all_results:
@@ -4873,6 +5188,10 @@ async def search(request: SearchRequest, api_key: APIKey = Depends(get_api_key),
             search_params=json.dumps(sanitize_params_for_log(params), ensure_ascii=False),
             results_count=len(all_results),
             source_api_key=source_api_key_str,
+            client_ip=(geo.get("ip") or client_ip or None),
+            client_city=(geo.get("city") or None),
+            client_region=(geo.get("region") or None),
+            client_country=(geo.get("country") or None),
         ))
         db.commit()
     except Exception as exc:
@@ -5009,16 +5328,34 @@ async def delete_key(key_id: int, db: Session = Depends(get_db), authenticated: 
 
 @app.get("/stats")
 async def get_stats(db: Session = Depends(get_db), authenticated: bool = Depends(get_master_api_key)):
-    total_keys = db.query(APIKey).count()
-    active_keys = db.query(APIKey).filter(APIKey.status == "active").count()
-    expired_keys = db.query(APIKey).filter(APIKey.status != "active").count()
-    total_searches = db.query(APIKey).with_entities(func.sum(APIKey.searches_used)).scalar() or 0
-    
+    try:
+        report = collect_usage_report(db)
+    except Exception:
+        logger.exception("stats collect failed")
+        raise HTTPException(status_code=500, detail="Не удалось собрать статистику")
+    keys_short = []
+    for block in report.get("keys") or []:
+        keys_short.append({
+            "id": block.get("id"),
+            "name": block.get("name"),
+            "key": block.get("key"),
+            "status": block.get("status"),
+            "searches_used": block.get("searches_used"),
+            "search_limit": block.get("search_limit"),
+            "last_used_at": block.get("last_used_at"),
+            "last_ip": block.get("last_ip"),
+            "last_city": block.get("last_place"),
+            "unique_ips": block.get("unique_ips"),
+            "unique_cities": block.get("unique_places"),
+            "recent": block.get("recent"),
+        })
     return {
-        "total_keys": total_keys,
-        "active_keys": active_keys,
-        "expired_keys": expired_keys,
-        "total_searches": total_searches
+        "total_keys": report.get("total_keys"),
+        "active_keys": report.get("active_keys"),
+        "expired_keys": max(0, int(report.get("total_keys") or 0) - int(report.get("active_keys") or 0)),
+        "total_searches": report.get("total_searches"),
+        "logged_events": report.get("logged_events"),
+        "keys": keys_short,
     }
 
 @app.get("/")
@@ -5147,8 +5484,9 @@ class TelegramBotManager:
                 return
             if "message is too long" in msg or "can't parse entities" in msg:
                 await query.edit_message_text(
-                    "Список слишком длинный для сообщения. Скачайте файл с ключами.",
+                    "Текст слишком длинный для сообщения. Скачайте файл.",
                     reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📥 Скачать статистику всех ключей", callback_data="export_stats")],
                         [InlineKeyboardButton("📥 Скачать ключи", callback_data="export_keys")],
                         [InlineKeyboardButton("↩️ Меню", callback_data="menu")],
                     ]),
@@ -5276,22 +5614,10 @@ class TelegramBotManager:
                 )
 
             elif data == "stats":
-                with self.db_session() as db:
-                    total_keys = db.query(APIKey).count()
-                    active_keys = db.query(APIKey).filter(APIKey.status == "active").count()
-                    total_searches = db.query(APIKey).with_entities(func.sum(APIKey.searches_used)).scalar() or 0
-                text = (
-                    "📊 Статистика системы:\n\n"
-                    f"🔑 Всего ключей: {total_keys}\n"
-                    f"✅ Активных ключей: {active_keys}\n"
-                    f"🔍 Всего поисков: {total_searches}\n"
-                )
-                await self._safe_edit(
-                    query,
-                    text,
-                    InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]),
-                    parse_mode=None,
-                )
+                await self._show_stats(query)
+
+            elif data == "export_stats":
+                await self._export_stats_file(query)
 
             elif data == "help":
                 text = (
@@ -5300,7 +5626,7 @@ class TelegramBotManager:
                     "📋 <b>Мои ключи</b> — полный список значений\n"
                     "📥 <b>Скачать ключи</b> — JSON-файл для бэкапа перед пересборкой\n"
                     "📤 <b>Загрузить ключи</b> — восстановить ключи из файла после деплоя\n"
-                    "📊 <b>Статистика</b> — количество ключей и поисков\n\n"
+                    "📊 <b>Статистика</b> — IP и город каждого использования ключа\n\n"
                     "Использование:\n"
                     "<code>Authorization: Bearer plut_...</code>"
                 )
@@ -5367,6 +5693,113 @@ class TelegramBotManager:
         await query.answer("Ключ удалён")
         await self._show_keys_list(query)
 
+    def _stats_keyboard(self, truncated: bool) -> InlineKeyboardMarkup:
+        rows = []
+        if truncated:
+            rows.append([InlineKeyboardButton("📥 Скачать статистику всех ключей", callback_data="export_stats")])
+        rows.append([InlineKeyboardButton("↩️ Меню", callback_data="menu")])
+        return InlineKeyboardMarkup(rows)
+
+    def _build_stats_message(self, report: Dict[str, Any]) -> Tuple[str, bool]:
+        header = (
+            "📊 <b>Статистика использования</b>\n\n"
+            f"🔑 Всего ключей: {report.get('total_keys')}\n"
+            f"✅ Активных: {report.get('active_keys')}\n"
+            f"🔍 Всего поисков: {report.get('total_searches')}\n"
+            f"📝 Записей в логах: {report.get('logged_events')}\n\n"
+        )
+        parts = [header]
+        for block in report.get("keys") or []:
+            status_emoji = "✅" if block.get("status") == "active" else "❌"
+            used = block.get("searches_used") or 0
+            limit = block.get("search_limit")
+            quota = f"{used}/{limit}" if limit else f"{used}/∞"
+            chunk = f"{status_emoji} <b>{self._esc(block.get('name'))}</b>\n"
+            chunk += f"   Ключ: <code>{self._esc(block.get('key'))}</code>\n"
+            chunk += f"   Использовано: {quota}\n"
+            last_ip = block.get("last_ip") or "нет данных"
+            last_place = block.get("last_place") or "город не определён"
+            chunk += f"   Последний IP: <code>{self._esc(last_ip)}</code>\n"
+            chunk += f"   Город: {self._esc(last_place)}\n"
+            unique_ips = block.get("unique_ips") or []
+            unique_places = block.get("unique_places") or []
+            if unique_ips:
+                shown_ips = ", ".join(unique_ips[:8])
+                if len(unique_ips) > 8:
+                    shown_ips += f" … +{len(unique_ips) - 8}"
+                chunk += f"   IP: <code>{self._esc(shown_ips)}</code>\n"
+            if unique_places:
+                shown_places = ", ".join(unique_places[:6])
+                if len(unique_places) > 6:
+                    shown_places += f" … +{len(unique_places) - 6}"
+                chunk += f"   Города: {self._esc(shown_places)}\n"
+            for row in (block.get("recent") or [])[:3]:
+                at = row.get("at") or "?"
+                if isinstance(at, str) and "T" in at:
+                    at = at.replace("T", " ")[:16]
+                ip = row.get("ip") or "IP неизвестен"
+                place = row.get("place") or "город не определён"
+                chunk += f"   • {self._esc(at)} | {self._esc(ip)} | {self._esc(place)}\n"
+            chunk += "\n"
+            parts.append(chunk)
+
+        text = "".join(parts).rstrip()
+        if len(text) <= TELEGRAM_HTML_LIMIT:
+            return text, False
+        shown = header
+        hidden = 0
+        for chunk in parts[1:]:
+            if hidden or len(shown) + len(chunk) + 220 > TELEGRAM_HTML_LIMIT:
+                hidden += 1
+                continue
+            shown += chunk
+        shown += "\nТекст слишком длинный — полный отчёт по всем ключам в файле."
+        if hidden:
+            shown += f" Скрыто ключей: {hidden}."
+        return shown, True
+
+    async def _show_stats(self, query):
+        try:
+            with self.db_session() as db:
+                report = collect_usage_report(db)
+        except Exception:
+            logger.exception("bot stats collect failed")
+            await self._safe_edit(
+                query,
+                "Не удалось собрать статистику. Попробуйте ещё раз.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]),
+                parse_mode=None,
+            )
+            return
+        text, truncated = self._build_stats_message(report)
+        await self._safe_edit(query, text, self._stats_keyboard(truncated))
+
+    async def _export_stats_file(self, query):
+        try:
+            with self.db_session() as db:
+                report = collect_usage_report(db)
+            body = render_usage_report_text(report)
+            bio = BytesIO(body.encode("utf-8"))
+            filename = f"gloomapi_stats_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
+            await query.message.reply_document(
+                document=InputFile(bio, filename=filename),
+                caption=(
+                    "📥 Статистика всех ключей\n"
+                    f"Ключей: {report.get('total_keys')} | "
+                    f"поисков: {report.get('total_searches')} | "
+                    f"записей: {report.get('logged_events')}"
+                ),
+            )
+            await query.answer("Файл отправлен")
+        except Forbidden:
+            await query.answer("Бот не может отправить файл. Напишите /start.", show_alert=True)
+        except TelegramError as exc:
+            logger.warning("export stats failed: %s", exc)
+            await query.answer("Не удалось отправить файл статистики", show_alert=True)
+        except Exception:
+            logger.exception("export stats failed")
+            await query.answer("Ошибка выгрузки статистики", show_alert=True)
+
     async def _show_key_logs(self, query, data: str):
         try:
             key_id = int(data.rsplit("_", 1)[-1])
@@ -5382,7 +5815,7 @@ class TelegramBotManager:
                 db.query(SearchLog)
                 .filter(SearchLog.api_key_id == key_id)
                 .order_by(SearchLog.created_at.desc())
-                .limit(20)
+                .limit(50)
                 .all()
             )
             text = f"📊 Логи ключа: {self._esc(key.name)}\n"
@@ -5396,13 +5829,19 @@ class TelegramBotManager:
                     except (TypeError, json.JSONDecodeError):
                         params = {}
                     created = log.created_at.strftime("%d.%m.%Y %H:%M") if log.created_at else "?"
+                    ip = (getattr(log, "client_ip", None) or "").strip() or "IP неизвестен"
+                    place = format_log_place(log) or "город не определён"
                     text += f"🔍 {created}\n"
+                    text += f"   IP: <code>{self._esc(ip)}</code>\n"
+                    text += f"   Город: {self._esc(place)}\n"
                     if isinstance(params, dict) and params:
                         text += f"   Параметры: {self._esc(', '.join(map(str, params.keys())))}\n"
                     text += f"   Результатов: {log.results_count}\n\n"
         keyboard = [[InlineKeyboardButton("↩️ Назад к ключам", callback_data="list_keys")]]
-        if len(text) > TELEGRAM_HTML_LIMIT:
-            text = text[: TELEGRAM_HTML_LIMIT - 20] + "\n…"
+        truncated = len(text) > TELEGRAM_HTML_LIMIT
+        if truncated:
+            text = text[: TELEGRAM_HTML_LIMIT - 80].rstrip() + "\n\n… полный отчёт в файле."
+            keyboard.insert(0, [InlineKeyboardButton("📥 Скачать статистику всех ключей", callback_data="export_stats")])
         await self._safe_edit(query, text, InlineKeyboardMarkup(keyboard))
 
     async def _export_keys_file(self, query):
