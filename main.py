@@ -15,8 +15,9 @@ from contextlib import asynccontextmanager, contextmanager
 from collections import defaultdict
 from time import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, ForeignKey, update, or_, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
@@ -6085,34 +6086,88 @@ class TelegramBotManager:
             await update.message.reply_text("Не удалось обработать файл. Проверьте формат JSON/TXT.")
 
     async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE):
-        logger.exception("telegram handler error: %s", context.error)
+        err = context.error
+        if isinstance(err, NetworkError):
+            logger.warning("telegram network error: %s", err)
+            return
+        logger.exception("telegram handler error: %s", err)
         try:
             if isinstance(update, Update) and update.effective_message:
                 await update.effective_message.reply_text("Произошла внутренняя ошибка. Попробуйте ещё раз.")
         except Exception:
             pass
 
+    @staticmethod
+    def _updater_running(application) -> bool:
+        updater = getattr(application, "updater", None)
+        if updater is None:
+            return False
+        return bool(getattr(updater, "running", None) or getattr(updater, "is_running", False))
+
+    async def _shutdown_application(self) -> None:
+        application = self.application
+        if not application:
+            return
+        updater = getattr(application, "updater", None)
+        try:
+            if updater is not None and self._updater_running(application):
+                await updater.stop()
+        except Exception:
+            logger.warning("updater stop failed", exc_info=True)
+        try:
+            if getattr(application, "running", False):
+                await application.stop()
+        except Exception:
+            logger.warning("application stop failed", exc_info=True)
+        try:
+            await application.shutdown()
+        except Exception:
+            logger.warning("application shutdown failed", exc_info=True)
+        logger.info("Telegram bot stopped")
+
     async def run_async(self):
         if not TELEGRAM_BOT_TOKEN:
             logger.warning("TELEGRAM_BOT_TOKEN не установлен. Бот не запущен.")
             return
 
-        try:
-            self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-            self.application.add_handler(CommandHandler("start", self.start_command))
-            self.application.add_handler(CallbackQueryHandler(self.days_callback, pattern="^days_"))
-            self.application.add_handler(CallbackQueryHandler(self.limit_callback, pattern="^limit_"))
-            self.application.add_handler(CallbackQueryHandler(self.button_callback))
-            self.application.add_handler(MessageHandler(filters.Document.ALL, self.document_handler))
-            self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_handler))
-            self.application.add_error_handler(self.on_error)
+        # Отдельный HTTPX-клиент для getUpdates: иначе long-poll гасит общий request.
+        request = HTTPXRequest(
+            connect_timeout=20.0,
+            read_timeout=30.0,
+            write_timeout=30.0,
+            pool_timeout=10.0,
+        )
+        get_updates_request = HTTPXRequest(
+            connect_timeout=20.0,
+            read_timeout=40.0,
+            write_timeout=30.0,
+            pool_timeout=10.0,
+        )
+        self.application = (
+            Application.builder()
+            .token(TELEGRAM_BOT_TOKEN)
+            .request(request)
+            .get_updates_request(get_updates_request)
+            .build()
+        )
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CallbackQueryHandler(self.days_callback, pattern="^days_"))
+        self.application.add_handler(CallbackQueryHandler(self.limit_callback, pattern="^limit_"))
+        self.application.add_handler(CallbackQueryHandler(self.button_callback))
+        self.application.add_handler(MessageHandler(filters.Document.ALL, self.document_handler))
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_handler))
+        self.application.add_error_handler(self.on_error)
 
+        stop_event = asyncio.Event()
+        try:
             await self.application.initialize()
             await self.application.start()
-            await self.application.updater.start_polling(drop_pending_updates=True)
+            await self.application.updater.start_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES,
+            )
             logger.info("Telegram bot polling started")
-            while self.application.updater and self.application.updater.is_running:
-                await asyncio.sleep(1)
+            await stop_event.wait()
         except asyncio.CancelledError:
             logger.info("Telegram polling cancelled")
             raise
@@ -6120,21 +6175,7 @@ class TelegramBotManager:
             logger.exception("Telegram polling failed")
             raise
         finally:
-            if self.application:
-                try:
-                    if self.application.updater and self.application.updater.is_running:
-                        await self.application.updater.stop()
-                except Exception:
-                    logger.warning("updater stop failed", exc_info=True)
-                try:
-                    await self.application.stop()
-                except Exception:
-                    logger.warning("application stop failed", exc_info=True)
-                try:
-                    await self.application.shutdown()
-                except Exception:
-                    logger.warning("application shutdown failed", exc_info=True)
-            logger.info("Telegram bot stopped")
+            await self._shutdown_application()
 
 if __name__ == "__main__":
     import uvicorn
