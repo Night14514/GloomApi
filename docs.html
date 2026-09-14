@@ -173,7 +173,10 @@
   -d '{"name": "MyKey", "days": 30, "limit": 10000}'</code>
             </div>
             <div class="response">
-                <strong>Ответ:</strong> JSON с ключом для использования в запросах
+                <strong>Ответ:</strong> JSON с ключом <code>plut_...</code> для использования в запросах
+            </div>
+            <div class="note">
+                <strong>Важно:</strong> новые ключи начинаются с <code>plut_</code>. Старые <code>sk_</code> продолжают работать. Перед пересборкой хоста выгрузите ключи файлом из Telegram-бота и загрузите их обратно после деплоя.
             </div>
         </div>
 
@@ -457,7 +460,9 @@
                 <div class="param-item">number</div>
                 <div class="param-item">bdate</div>
                 <div class="param-item">domain</div>
-                <div class="param-item">photo_url</div>
+                <div class="param-item">password</div>
+                <div class="param-item">tiktok</div>
+                <div class="param-item">github</div>
                 <div class="param-item">output_file</div>
             </div>
         </div>
@@ -514,6 +519,9 @@
                 <div class="param-item">QuickFlow</div>
                 <div class="param-item">FunStat</div>
                 <div class="param-item">Gerhano</div>
+                <div class="param-item">LocalSearch</div>
+                <div class="param-item">NetSpy</div>
+                <div class="param-item">SEON</div>
             </div>
             <div class="note">
                 <strong>Примечание:</strong> Каждый запрос автоматически распределяется между всеми доступными API для получения максимально полных результатов

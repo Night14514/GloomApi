@@ -11,20 +11,23 @@ from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from collections import defaultdict
 from time import time
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, ForeignKey, update
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Boolean, Text, ForeignKey, update, or_
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from sqlalchemy.sql import func
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from typing import Optional, Dict, Any, List, Tuple, Callable, Annotated
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 import secrets
 import json
 import os
@@ -38,6 +41,7 @@ import asyncio
 import threading
 import hmac
 import base64
+import html
 from dotenv import load_dotenv
 
 try:
@@ -181,7 +185,7 @@ def get_db():
 class APIKey(Base):
     __tablename__ = "api_keys"
     id = Column(Integer, primary_key=True, index=True)
-    key = Column(String(64), unique=True, index=True, nullable=False)
+    key = Column(String(128), unique=True, index=True, nullable=False)
     key_hash = Column(String(64), unique=True, index=True, nullable=False)
     name = Column(String(255), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -254,6 +258,8 @@ class SearchRequest(BaseModel):
     domain: Optional[str] = Field(None, max_length=253)
     photo_url: Optional[str] = Field(None, max_length=2048)
     password: Optional[str] = Field(None, max_length=256)
+    tiktok: Optional[str] = Field(None, max_length=256)
+    github: Optional[str] = Field(None, max_length=256)
     output_file: Optional[str] = Field(None, max_length=255)
 
     @field_validator("*", mode="before")
@@ -435,6 +441,14 @@ W2SP3R_API_KEY = "Mg05qwg9kfJZgMA1sUshI_-LxS6c33iQWR4JslZRubc"
 QUICKFLOW_TOKEN = "063b6819d85570dfe1b5f5b4ba5be14ac1d66a74e848ee9d1588068a9cf9b372"
 FUNSTAT_TOKEN_ALT = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiI4OTIxNDc4MTAyIiwianRpIjoiOGUxOWIwYzgtNDc5Yi00YmE4LWEwMTYtNjZmOTcxMTQyMGQyIiwiZXhwIjoxODEyMDUyMzc3fQ.tLuq42piT66rfewe0N8Ui37IdsSjbxB8RHPWXIemn3UeuO489wYBSoHeNTKC5SFzif8wACjzwdK8v6GVX80Vj-fhN58d5eV2odONXtgfVXrIVARrpNhoWZ4hKufJ_RqiTfJSjvlO_yEI7G8FBpAG7IZY4YqEUwqDgkGkfkXUYlk"
 GERHANO_API_KEY = "ns-MVzUx4QtfyiQrQ72qTOz2UoZWeiHMa1f"
+LOCALSEARCH_BASE_URL = os.getenv("LOCALSEARCH_BASE_URL", "http://192.99.16.76:5009")
+NETSPY_API_KEY = os.getenv("NETSPY_API_KEY", "ns-ecwKK6MKcguV8vQa3QUwgbUzKu6vvfxj")
+NETSPY_BASE_URL = os.getenv("NETSPY_BASE_URL", "https://netspy.sbs")
+API_KEY_PREFIX = "plut_"
+LEGACY_API_KEY_PREFIX = "sk_"
+KEYS_BACKUP_MAX_BYTES = 512 * 1024
+KEYS_BACKUP_MAX_ITEMS = 500
+TELEGRAM_HTML_LIMIT = 3900
 
 # ============================================================================
 # ПОИСКОВЫЕ МОДУЛИ ДЛЯ КАЖДОГО API
@@ -580,7 +594,7 @@ class CircuitBreaker:
 circuit_breaker = CircuitBreaker()
 HTTP_SESSION = requests.Session()
 HTTP_SESSION.headers.update({
-    "User-Agent": "GloomApi/2.1",
+    "User-Agent": "GloomApi/2.2",
     "Accept": "application/json, text/plain, */*",
 })
 _http_retry = Retry(
@@ -816,7 +830,7 @@ class DepSearchModule(BaseSearchModule):
     SUPPORTED_FIELDS = [
         "phone", "email", "nick", "username", "name", "fio", "fullname", "passport",
         "inn", "snils", "vin", "car_number", "ip", "telegram", "telegram_id",
-        "vk", "vk_id", "card", "imei", "address", "social",
+        "vk", "vk_id", "card", "imei", "address", "social", "password", "tiktok",
     ]
     TIMEOUT = 20.0
 
@@ -851,6 +865,11 @@ class DepSearchModule(BaseSearchModule):
             return q if q.isdigit() else f"nick:{q.lstrip('@')}"
         if field in ("name", "fio", "fullname"):
             return value
+        if field == "password":
+            return value if value.lower().startswith("pass:") else f"pass:{value}"
+        if field == "tiktok":
+            cleaned = value.lstrip("@")
+            return cleaned if cleaned.lower().startswith("tt:") else f"tt:{cleaned}"
         if field in ("vin", "car_number", "ip", "passport", "card", "imei", "social"):
             return value
         return value
@@ -899,6 +918,7 @@ class DepSearchModule(BaseSearchModule):
             "phone", "email", "fio", "fullname", "name", "nick", "username",
             "vk", "vk_id", "inn", "snils", "vin", "car_number", "ip",
             "telegram", "telegram_id", "address", "passport", "card", "imei", "social",
+            "password", "tiktok",
         ]
         for field in field_order:
             value = params.get(field)
@@ -1538,64 +1558,76 @@ class DeepScanModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class BigBaseModule(BaseSearchModule):
-    # auto-disabled: ошибка авторизации
-    ENABLED = False
-    """BigBase API - универсальный поиск и открытие досье"""
-    
+    """BigBase API — POST /api/search, Authorization без Bearer, body {"search": "..."}."""
+
+    SUPPORTED_FIELDS = [
+        "phone", "email", "fio", "fullname", "name", "ip", "inn", "snils",
+        "passport", "vin", "car_number", "address",
+    ]
+    TIMEOUT = 20.0
+
     def __init__(self):
-        self.base_url = BIGBASE_API_URL
-        self.api_key = BIGBASE_API_KEY
-    
+        extra = [x.strip() for x in str(BIGBASE_API_KEYS or "").split(",") if x.strip()]
+        keys = [BIGBASE_API_KEY, BIGBASE_TOKEN, *extra]
+        self.keys = list(dict.fromkeys(k for k in keys if k))
+        self.base_url = "https://bigbase.top/api/search"
+
+    def _search_once(self, query: str) -> Tuple[Optional[dict], Optional[str]]:
+        last_error = None
+        for key in self.keys:
+            response, err = self._post(
+                self.base_url,
+                json={"search": query},
+                headers={"Authorization": key, "Content-Type": "application/json"},
+            )
+            if err and response is None:
+                last_error = err
+                continue
+            if response is None:
+                last_error = err or "no response"
+                continue
+            if response.status_code in (401, 403):
+                last_error = f"auth HTTP {response.status_code}"
+                continue
+            if response.status_code == 429:
+                return None, "rate_limited"
+            if response.status_code != 200:
+                last_error = f"HTTP {response.status_code}"
+                continue
+            try:
+                data = response.json()
+            except Exception:
+                last_error = "invalid json"
+                continue
+            if isinstance(data, dict) and data.get("error") and not data.get("results") and not data.get("data"):
+                last_error = str(data.get("error"))
+                continue
+            if data:
+                return data, None
+            last_error = "empty"
+        return None, last_error or "BigBase unavailable"
+
     def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
         results = []
-        
-        # Mapping параметров к типам поиска BigBase
-        param_mapping = {
-            "phone": "phone",
-            "email": "email",
-            "fio": "fio",
-            "fullname": "fio",
-            "name": "fio",
-            "nick": "nick",
-            "vk": "vk",
-            "telegram": "telegram",
-            "ip": "ip",
-            "inn": "inn",
-            "snils": "snils",
-            "passport": "passport",
-            "vin": "vin",
-            "car_number": "car",
-            "address": "address"
-        }
-        
-        for local_param, search_type in param_mapping.items():
-            if params.get(local_param):
-                try:
-                    response = requests.post(
-                        f"{self.base_url}/search",
-                        json={"type": search_type, "query": params[local_param]},
-                        headers={"Authorization": f"Bearer {self.api_key}"},
-                        timeout=10
-                    )
-                    if response.status_code == 200:
-                        data = response.json()
-                        results.append({
-                            "source": "bigbase",
-                            "field": local_param,
-                            "value": params[local_param],
-                            "found": True,
-                            "data": data
-                        })
-                except Exception as e:
-                    results.append({
-                        "source": "bigbase",
-                        "field": local_param,
-                        "value": params[local_param],
-                        "found": False,
-                        "error": str(e)
-                    })
-        
-        return {"success": len(results) > 0, "results": results, "total": len(results)}
+        seen = set()
+        field_order = [
+            "phone", "email", "fio", "fullname", "name", "ip", "inn", "snils",
+            "passport", "vin", "car_number", "address",
+        ]
+        for field in field_order:
+            value = params.get(field)
+            if not value:
+                continue
+            query = normalize_phone(value) if field == "phone" else str(value).strip()
+            if not query or query in seen:
+                continue
+            seen.add(query)
+            data, error = self._search_once(query)
+            if data is not None:
+                results.append(_result_ok("bigbase", field, value, data))
+            elif error:
+                logger.debug("BigBase %s: %s", query, error)
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
 
 class OnuxModule(BaseSearchModule):
     # auto-disabled: DNS недоступен
@@ -3145,44 +3177,44 @@ class W2SP3RModule(BaseSearchModule):
         return {"success": len(results) > 0, "results": results, "total": len(results)}
 
 class QuickFlowModule(BaseSearchModule):
-    # auto-disabled: непроверенный ключ
-    ENABLED = False
-    """QuickFlow API - универсальный поиск"""
-    
+    """QuickFlow Telegram lookup — GET /get-user?username=<без @>&token=..."""
+
+    SUPPORTED_FIELDS = ["telegram", "username", "nick"]
+    TIMEOUT = 15.0
+
     def __init__(self):
-        self.base_url = "https://api.quickflow.lat"
-        self.api_key = QUICKFLOW_TOKEN
-    
+        self.base_url = "https://api.quickflow.lat/get-user"
+        self.token = QUICKFLOW_TOKEN
+
     def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
         results = []
-        
-        query = params.get("phone") or params.get("email") or params.get("username") or params.get("ip")
-        if query:
-            try:
-                response = requests.get(
-                    f"{self.base_url}/search",
-                    params={"token": self.api_key, "query": query},
-                    timeout=10
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    results.append({
-                        "source": "quickflow",
-                        "field": "query",
-                        "value": query,
-                        "found": True,
-                        "data": data
-                    })
-            except Exception as e:
-                results.append({
-                    "source": "quickflow",
-                    "field": "query",
-                    "value": query,
-                    "found": False,
-                    "error": str(e)
-                })
-        
-        return {"success": len(results) > 0, "results": results, "total": len(results)}
+        raw = params.get("telegram") or params.get("username") or params.get("nick")
+        if not raw:
+            return {"success": False, "results": [], "total": 0}
+        username = normalize_telegram_query(str(raw)).lstrip("@")
+        if not username or username.isdigit():
+            logger.debug("QuickFlow skip: numeric telegram_id is not supported")
+            return {"success": False, "results": [], "total": 0}
+        response, err = self._get(self.base_url, params={"username": username, "token": self.token})
+        if err and response is None:
+            results.append(_result_err("quickflow", "telegram", username, err))
+            return {"success": False, "results": results, "total": len(results)}
+        if response is None:
+            results.append(_result_err("quickflow", "telegram", username, err or "no response"))
+            return {"success": False, "results": results, "total": len(results)}
+        if response.status_code != 200:
+            results.append(_result_err("quickflow", "telegram", username, f"HTTP {response.status_code}"))
+            return {"success": False, "results": results, "total": len(results)}
+        try:
+            data = response.json()
+        except Exception:
+            results.append(_result_err("quickflow", "telegram", username, "invalid json"))
+            return {"success": False, "results": results, "total": len(results)}
+        if not data or (isinstance(data, dict) and data.get("error") and not data.get("user") and not data.get("data")):
+            results.append(_result_err("quickflow", "telegram", username, (data or {}).get("error") if isinstance(data, dict) else "empty"))
+            return {"success": False, "results": results, "total": len(results)}
+        results.append(_result_ok("quickflow", "telegram", username, data))
+        return {"success": True, "results": results, "total": len(results)}
 
 class FunStatModule(BaseSearchModule):
     # auto-disabled: непроверенный ключ
@@ -3263,6 +3295,182 @@ class GerhanoModule(BaseSearchModule):
                 })
         
         return {"success": len(results) > 0, "results": results, "total": len(results)}
+
+
+class LocalSearchModule(BaseSearchModule):
+    """LocalSearch — открытый узел GET /search?query=&type= (без авторизации)."""
+
+    SUPPORTED_FIELDS = [
+        "email", "domain", "phone", "number", "ip", "username", "nick",
+        "name", "fio", "fullname", "inn", "snils", "passport", "vin",
+        "car_number", "address",
+    ]
+    TIMEOUT = 15.0
+    TYPE_MAP = {
+        "email": "email",
+        "domain": "domain",
+        "phone": "phone",
+        "number": "phone",
+        "ip": "ip",
+        "username": "username",
+        "nick": "username",
+        "name": "name",
+        "fio": "name",
+        "fullname": "name",
+        "inn": "inn",
+        "snils": "snils",
+        "passport": "passport",
+        "vin": "auto",
+        "car_number": "auto",
+        "address": "address",
+    }
+
+    def __init__(self):
+        self.base_url = LOCALSEARCH_BASE_URL.rstrip("/") + "/search"
+
+    def _query(self, search_type: str, query: str) -> Tuple[Optional[dict], Optional[str]]:
+        response, err = self._get(self.base_url, params={"query": query, "type": search_type})
+        if err and response is None:
+            return None, err
+        if response is None:
+            return None, err or "no response"
+        if response.status_code == 429:
+            return None, "rate_limited"
+        if response.status_code != 200:
+            return None, f"HTTP {response.status_code}"
+        try:
+            data = response.json()
+        except Exception:
+            text = (response.text or "").strip()
+            if not text:
+                return None, "empty"
+            return {"raw": text[:4000]}, None
+        if not data:
+            return None, "empty"
+        if isinstance(data, dict) and data.get("error") and not data.get("results") and not data.get("data"):
+            return None, str(data.get("error"))
+        return data, None
+
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        seen = set()
+        for field, search_type in self.TYPE_MAP.items():
+            value = params.get(field)
+            if not value:
+                continue
+            query = normalize_phone(value) if field in ("phone", "number") else str(value).strip()
+            cache_key = (search_type, query)
+            if not query or cache_key in seen:
+                continue
+            seen.add(cache_key)
+            data, error = self._query(search_type, query)
+            if data is not None:
+                results.append(_result_ok("localsearch", field, value, data, method=search_type))
+            elif error:
+                logger.debug("LocalSearch %s/%s: %s", search_type, query, error)
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
+
+
+class NetSpyModule(BaseSearchModule):
+    """NetSpy — POST /api/search, header X-API-Key, body {query, search_type}."""
+
+    SUPPORTED_FIELDS = [
+        "phone", "number", "email", "fio", "fullname", "name", "nick", "username",
+        "telegram", "telegram_id", "vk", "vk_id", "card", "tiktok", "address", "github",
+    ]
+    TIMEOUT = 20.0
+    FIELD_TYPE = {
+        "phone": "phone",
+        "number": "phone",
+        "email": "email",
+        "fio": "fio",
+        "fullname": "fio",
+        "name": "fio",
+        "nick": "nick",
+        "username": "nick",
+        "telegram": "tg",
+        "telegram_id": "tg",
+        "vk": "vk",
+        "vk_id": "vk",
+        "card": "card",
+        "tiktok": "tiktok",
+        "address": "address",
+        "github": "github",
+    }
+
+    def __init__(self):
+        self.base_url = NETSPY_BASE_URL.rstrip("/") + "/api/search"
+        self.keys = [k for k in (NETSPY_API_KEY, GERHANO_API_KEY) if k]
+
+    def _prepare_query(self, field: str, value: str) -> Optional[str]:
+        value = str(value).strip()
+        if not value:
+            return None
+        if field in ("phone", "number"):
+            return normalize_phone(value) or value
+        if field in ("telegram", "telegram_id", "nick", "username"):
+            return normalize_telegram_query(value).lstrip("@")
+        if field in ("vk", "vk_id"):
+            return extract_vk_id(value)
+        if field == "tiktok":
+            return value.lstrip("@").replace("https://www.tiktok.com/@", "").replace("https://tiktok.com/@", "")
+        if field == "github":
+            return value.replace("https://github.com/", "").replace("http://github.com/", "").strip("/")
+        return value
+
+    def _search_once(self, search_type: str, query: str) -> Tuple[Optional[dict], Optional[str]]:
+        last_error = None
+        for key in self.keys:
+            response, err = self._post(
+                self.base_url,
+                json={"query": query, "search_type": search_type},
+                headers={"X-API-Key": key, "Content-Type": "application/json"},
+            )
+            if err and response is None:
+                last_error = err
+                continue
+            if response is None:
+                last_error = err or "no response"
+                continue
+            if response.status_code in (401, 403):
+                last_error = f"auth HTTP {response.status_code}"
+                continue
+            if response.status_code == 429:
+                return None, "rate_limited"
+            if response.status_code != 200:
+                last_error = f"HTTP {response.status_code}"
+                continue
+            try:
+                data = response.json()
+            except Exception:
+                last_error = "invalid json"
+                continue
+            if isinstance(data, dict) and data.get("error") and not data.get("results") and not data.get("data"):
+                last_error = str(data.get("error"))
+                continue
+            if data:
+                return data, None
+            last_error = "empty"
+        return None, last_error or "NetSpy unavailable"
+
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        seen = set()
+        for field, search_type in self.FIELD_TYPE.items():
+            value = params.get(field)
+            if not value:
+                continue
+            query = self._prepare_query(field, value)
+            cache_key = (search_type, query)
+            if not query or cache_key in seen:
+                continue
+            seen.add(cache_key)
+            data, error = self._search_once(search_type, query)
+            if data is not None:
+                results.append(_result_ok("netspy", field, value, data, method=search_type))
+            elif error:
+                logger.debug("NetSpy %s/%s: %s", search_type, query, error)
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
 
 
 # ============================================================================
@@ -3948,6 +4156,225 @@ def hash_key(key: str) -> str:
     return hashlib.sha256(str(key).encode("utf-8")).hexdigest()
 
 
+def generate_api_key_value() -> str:
+    """Клиентский ключ GloomApi: plut_ + urlsafe token."""
+    return f"{API_KEY_PREFIX}{secrets.token_urlsafe(32)}"
+
+
+def _dt_to_iso(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        if getattr(value, "tzinfo", None):
+            return value.isoformat()
+        return value.isoformat() + "Z"
+    except Exception:
+        return str(value)
+
+
+def _parse_iso_dt(value: Any) -> Optional[datetime]:
+    if value in (None, "", 0, "null"):
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+        return parsed.replace(tzinfo=None)
+    except ValueError:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+    return None
+
+
+def serialize_api_key(key: APIKey) -> Dict[str, Any]:
+    return {
+        "id": key.id,
+        "key": key.key,
+        "name": key.name,
+        "created_at": _dt_to_iso(key.created_at),
+        "expires_at": _dt_to_iso(key.expires_at),
+        "search_limit": key.search_limit,
+        "searches_used": key.searches_used or 0,
+        "status": key.status or "active",
+        "created_by": key.created_by,
+        "last_used_at": _dt_to_iso(key.last_used_at),
+        "ip_restrictions": key.ip_restrictions,
+    }
+
+
+def build_keys_backup(keys: List[APIKey]) -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "count": len(keys),
+        "keys": [serialize_api_key(k) for k in keys],
+    }
+
+
+_KEY_LINE_RE = re.compile(
+    rf"^(?:{re.escape(API_KEY_PREFIX)}|{re.escape(LEGACY_API_KEY_PREFIX)})[A-Za-z0-9_-]{{16,120}}$"
+)
+
+
+def parse_keys_backup(raw: bytes) -> List[Dict[str, Any]]:
+    """Разбор JSON-бэкапа или текстового списка ключей."""
+    if not raw:
+        raise ValueError("Пустой файл")
+    if len(raw) > KEYS_BACKUP_MAX_BYTES:
+        raise ValueError("Файл слишком большой (лимит 512 КБ)")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Файл должен быть в UTF-8") from exc
+    text = text.strip()
+    if not text:
+        raise ValueError("Пустой файл")
+
+    items: List[Dict[str, Any]] = []
+    if text[0] in "{[":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Некорректный JSON: {exc.msg}") from exc
+        if isinstance(data, dict):
+            raw_items = data.get("keys")
+            if raw_items is None and data.get("key"):
+                raw_items = [data]
+            if raw_items is None:
+                raise ValueError("В JSON нет массива keys")
+        elif isinstance(data, list):
+            raw_items = data
+        else:
+            raise ValueError("Неизвестный JSON-формат")
+        if not isinstance(raw_items, list):
+            raise ValueError("keys должен быть массивом")
+        for idx, row in enumerate(raw_items, start=1):
+            if isinstance(row, str):
+                row = {"key": row.strip()}
+            if not isinstance(row, dict):
+                raise ValueError(f"Элемент #{idx} не объект")
+            key_value = str(row.get("key") or "").strip()
+            if not key_value:
+                raise ValueError(f"Элемент #{idx}: нет ключа")
+            items.append({
+                "key": key_value,
+                "name": str(row.get("name") or f"imported-{idx}")[:255],
+                "expires_at": _parse_iso_dt(row.get("expires_at")),
+                "search_limit": row.get("search_limit"),
+                "searches_used": row.get("searches_used") or 0,
+                "status": str(row.get("status") or "active")[:20],
+                "created_by": row.get("created_by"),
+                "ip_restrictions": row.get("ip_restrictions"),
+                "created_at": _parse_iso_dt(row.get("created_at")),
+                "last_used_at": _parse_iso_dt(row.get("last_used_at")),
+            })
+    else:
+        for idx, line in enumerate(text.splitlines(), start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            name = None
+            key_value = line
+            if "|" in line:
+                left, right = line.split("|", 1)
+                left, right = left.strip(), right.strip()
+                if _KEY_LINE_RE.match(left) and not _KEY_LINE_RE.match(right):
+                    key_value, name = left, right
+                else:
+                    name, key_value = left, right
+            if not _KEY_LINE_RE.match(key_value):
+                raise ValueError(f"Строка {idx}: не похоже на ключ plut_/sk_")
+            items.append({
+                "key": key_value,
+                "name": (name or f"imported-{idx}")[:255],
+                "expires_at": None,
+                "search_limit": None,
+                "searches_used": 0,
+                "status": "active",
+                "created_by": None,
+                "ip_restrictions": None,
+                "created_at": None,
+                "last_used_at": None,
+            })
+
+    if not items:
+        raise ValueError("В файле нет ключей")
+    if len(items) > KEYS_BACKUP_MAX_ITEMS:
+        raise ValueError(f"Слишком много ключей (лимит {KEYS_BACKUP_MAX_ITEMS})")
+    return items
+
+
+def import_api_keys(db: Session, items: List[Dict[str, Any]], created_by: Optional[int] = None) -> Dict[str, int]:
+    """Импорт ключей без дублей. Существующие (по key/hash) пропускаются."""
+    added = skipped = failed = 0
+    for item in items:
+        key_value = str(item.get("key") or "").strip()
+        if not key_value or len(key_value) < 16 or len(key_value) > 128:
+            failed += 1
+            continue
+        digest = hash_key(key_value)
+        exists = db.query(APIKey).filter(
+            or_(APIKey.key == key_value, APIKey.key_hash == digest)
+        ).first()
+        if exists:
+            skipped += 1
+            continue
+        ip_restrictions = item.get("ip_restrictions")
+        if isinstance(ip_restrictions, (list, dict)):
+            ip_restrictions = json.dumps(ip_restrictions, ensure_ascii=False)
+        elif ip_restrictions is not None:
+            ip_restrictions = str(ip_restrictions)
+        try:
+            used = int(item.get("searches_used") or 0)
+        except (TypeError, ValueError):
+            used = 0
+        limit = item.get("search_limit")
+        try:
+            limit = int(limit) if limit not in (None, "", "null") else None
+        except (TypeError, ValueError):
+            limit = None
+        status = str(item.get("status") or "active").lower()
+        if status not in ("active", "inactive"):
+            status = "active"
+        created_by_val = item.get("created_by")
+        try:
+            created_by_val = int(created_by_val) if created_by_val not in (None, "") else created_by
+        except (TypeError, ValueError):
+            created_by_val = created_by
+        try:
+            api_key = APIKey(
+                key=key_value,
+                key_hash=digest,
+                name=str(item.get("name") or "imported")[:255],
+                expires_at=item.get("expires_at"),
+                search_limit=limit,
+                searches_used=max(0, used),
+                status=status,
+                created_by=created_by_val,
+                created_at=item.get("created_at") or datetime.utcnow(),
+                last_used_at=item.get("last_used_at"),
+                ip_restrictions=ip_restrictions,
+            )
+            db.add(api_key)
+            db.commit()
+            added += 1
+        except IntegrityError:
+            db.rollback()
+            skipped += 1
+        except Exception as exc:
+            logger.warning("import key failed: %s", exc)
+            db.rollback()
+            failed += 1
+    return {"added": added, "skipped": skipped, "failed": failed}
+
+
 def verify_ip_restrictions(api_key: APIKey, client_ip: str) -> bool:
     """Проверка IP ограничений ключа"""
     if not api_key.ip_restrictions:
@@ -4119,7 +4546,7 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
-app = FastAPI(title="GloomApi - Search API", version="2.1", lifespan=lifespan)
+app = FastAPI(title="GloomApi - Search API", version="2.2", lifespan=lifespan)
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -4247,6 +4674,8 @@ search_modules = [
     QuickFlowModule(),
     FunStatModule(),
     GerhanoModule(),
+    LocalSearchModule(),
+    NetSpyModule(),
 ]
 
 # ============================================================================
@@ -4483,23 +4912,31 @@ async def search(request: SearchRequest, api_key: APIKey = Depends(get_api_key),
 
 @app.post("/key")
 async def create_key(request: CreateKeyRequest, db: Session = Depends(get_db), authenticated: bool = Depends(get_master_api_key)):
-    key_value = f"sk_{secrets.token_urlsafe(32)}"
+    key_value = generate_api_key_value()
     key_hash = hash_key(key_value)
     expires_at = datetime.utcnow() + timedelta(days=request.days) if request.days else None
     ip_restrictions_json = json.dumps(request.ip_restrictions) if request.ip_restrictions else None
-    
-    api_key = APIKey(
-        key=key_value,
-        key_hash=key_hash,
-        name=request.name,
-        expires_at=expires_at,
-        search_limit=request.limit,
-        ip_restrictions=ip_restrictions_json
-    )
-    db.add(api_key)
-    db.commit()
-    db.refresh(api_key)
-    # полный ключ отдаём только один раз при создании; hash наружу не отдаём
+
+    try:
+        api_key = APIKey(
+            key=key_value,
+            key_hash=key_hash,
+            name=request.name,
+            expires_at=expires_at,
+            search_limit=request.limit,
+            ip_restrictions=ip_restrictions_json
+        )
+        db.add(api_key)
+        db.commit()
+        db.refresh(api_key)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Не удалось создать уникальный ключ, повторите запрос")
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("create_key db error")
+        raise HTTPException(status_code=500, detail="Ошибка сохранения ключа")
+
     return {
         "id": api_key.id,
         "key": api_key.key,
@@ -4515,23 +4952,31 @@ async def create_key(request: CreateKeyRequest, db: Session = Depends(get_db), a
 @app.get("/keys")
 async def list_keys(db: Session = Depends(get_db), authenticated: bool = Depends(get_master_api_key)):
     keys = db.query(APIKey).all()
-    # Скрываем реальные ключи в ответе
-    result = []
-    for key in keys:
-        key_dict = {
-            "id": key.id,
-            "name": key.name,
-            "key": (key.key[:12] + "..." + key.key[-4:]) if key.key and len(key.key) > 20 else "***",
-            "created_at": key.created_at,
-            "expires_at": key.expires_at,
-            "search_limit": key.search_limit,
-            "searches_used": key.searches_used,
-            "status": key.status,
-            "created_by": key.created_by,
-            "last_used_at": key.last_used_at
-        }
-        result.append(key_dict)
-    return result
+    return [serialize_api_key(key) for key in keys]
+
+
+@app.get("/keys/export")
+async def export_keys(db: Session = Depends(get_db), authenticated: bool = Depends(get_master_api_key)):
+    keys = db.query(APIKey).order_by(APIKey.id.asc()).all()
+    return build_keys_backup(keys)
+
+
+@app.post("/keys/import")
+async def import_keys_http(request: Request, db: Session = Depends(get_db), authenticated: bool = Depends(get_master_api_key)):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Ожидается JSON")
+    try:
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        items = parse_keys_backup(raw)
+        stats = import_api_keys(db, items)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        logger.exception("HTTP keys import failed")
+        raise HTTPException(status_code=500, detail="Не удалось импортировать ключи")
+    return {"success": True, **stats}
 
 @app.get("/key/{key_id}")
 async def get_key(key_id: int, db: Session = Depends(get_db), authenticated: bool = Depends(get_master_api_key)):
@@ -4582,7 +5027,7 @@ async def root():
     enabled = [m.__class__.__name__ for m in search_modules if getattr(m, "ENABLED", True)]
     return {
         "name": "GloomApi - Search API",
-        "version": "2.1",
+        "version": "2.2",
         "docs": "/docs",
         "modules_count": len(module_names),
         "modules_enabled": len(enabled),
@@ -4591,7 +5036,9 @@ async def root():
         "endpoints": {
             "/search": "POST - параллельный поиск по всем источникам",
             "/key": "POST - создать ключ (master)",
-            "/keys": "GET - список ключей (master)",
+            "/keys": "GET - список ключей (master, полные значения)",
+            "/keys/export": "GET - бэкап ключей JSON (master)",
+            "/keys/import": "POST - восстановить ключи из JSON (master)",
             "/key/{id}": "GET/DELETE - ключ (master)",
             "/stats": "GET - статистика (master)",
         },
@@ -4604,326 +5051,402 @@ async def root():
 class TelegramBotManager:
     def __init__(self):
         self.application = None
-        
+
     def get_db(self):
         return SessionLocal()
-    
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка команды /start"""
-        user_id = update.effective_user.id
-        print(f"🚀 ENTER start_command for user {user_id}")
-        
+
+    @contextmanager
+    def db_session(self):
+        db = self.get_db()
         try:
-            if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
-                await update.message.reply_text(
-                    "🚫 У вас нет доступа к этому боту.\n"
-                    "Этот бот доступен только для администраторов."
-                )
-                print(f"✅ EXIT start_command for user {user_id} (access denied)")
+            yield db
+        finally:
+            db.close()
+
+    def _is_admin(self, user_id: Optional[int]) -> bool:
+        if not ADMIN_TELEGRAM_IDS:
+            return True
+        return bool(user_id) and int(user_id) in ADMIN_TELEGRAM_IDS
+
+    def _esc(self, value: Any) -> str:
+        return html.escape(str(value or ""), quote=False)
+
+    def _menu_keyboard(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔑 Создать ключ", callback_data="create_key")],
+            [InlineKeyboardButton("📋 Мои ключи", callback_data="list_keys")],
+            [InlineKeyboardButton("📥 Скачать ключи", callback_data="export_keys")],
+            [InlineKeyboardButton("📤 Загрузить ключи", callback_data="import_keys")],
+            [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+            [InlineKeyboardButton("❓ Помощь", callback_data="help")],
+        ])
+
+    def _keys_action_keyboard(self, keys: List[APIKey]) -> InlineKeyboardMarkup:
+        keyboard = []
+        for key in keys:
+            row = []
+            if key.status == "active":
+                row.append(InlineKeyboardButton("🚫 Деактивировать", callback_data=f"deactivate_key_{key.id}"))
+            else:
+                row.append(InlineKeyboardButton("✅ Активировать", callback_data=f"activate_key_{key.id}"))
+            row.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{key.id}"))
+            row.append(InlineKeyboardButton("📊 Логи", callback_data=f"key_logs_{key.id}"))
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("📥 Скачать ключи", callback_data="export_keys")])
+        keyboard.append([InlineKeyboardButton("📤 Загрузить ключи", callback_data="import_keys")])
+        keyboard.append([InlineKeyboardButton("↩️ Меню", callback_data="menu")])
+        return InlineKeyboardMarkup(keyboard)
+
+    def _format_key_block(self, key: APIKey) -> str:
+        status_emoji = "✅" if key.status == "active" else "❌"
+        block = f"{status_emoji} <b>{self._esc(key.name)}</b>\n"
+        block += f"   Ключ: <code>{self._esc(key.key)}</code>\n"
+        block += f"   Использовано: {key.searches_used or 0}"
+        if key.search_limit:
+            block += f"/{key.search_limit}"
+        else:
+            block += "/∞"
+        block += "\n"
+        if key.expires_at:
+            try:
+                block += f"   Истекает: {key.expires_at.strftime('%d.%m.%Y %H:%M')}\n"
+            except Exception:
+                block += "   Истекает: неизвестно\n"
+        else:
+            block += "   Истекает: без срока\n"
+        block += "\n"
+        return block
+
+    def _build_keys_message(self, keys: List[APIKey]) -> str:
+        if not keys:
+            return "📋 Нет созданных ключей"
+        header = "📋 Все ключи (значения полностью):\n\n"
+        body = "".join(self._format_key_block(k) for k in keys)
+        footer = "\nЧтобы не потерять ключи после пересборки — скачайте файл и загрузите его обратно."
+        text = header + body + footer
+        if len(text) <= TELEGRAM_HTML_LIMIT:
+            return text
+        shown = header
+        for key in keys:
+            block = self._format_key_block(key)
+            if len(shown) + len(block) + 180 > TELEGRAM_HTML_LIMIT:
+                break
+            shown += block
+        shown += (
+            f"… и ещё {max(0, len(keys) - shown.count('Ключ:'))} ключ(ей).\n"
+            "Полный список в файле по кнопке «Скачать ключи»."
+        )
+        return shown
+
+    async def _safe_edit(self, query, text: str, reply_markup=None, parse_mode="HTML"):
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except BadRequest as exc:
+            msg = str(exc).lower()
+            if "message is not modified" in msg:
                 return
-            
-            keyboard = [
-                [InlineKeyboardButton("🔑 Создать ключ", callback_data="create_key")],
-                [InlineKeyboardButton("📋 Мои ключи", callback_data="list_keys")],
-                [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-                [InlineKeyboardButton("❓ Помощь", callback_data="help")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
+            if "message is too long" in msg or "can't parse entities" in msg:
+                await query.edit_message_text(
+                    "Список слишком длинный для сообщения. Скачайте файл с ключами.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📥 Скачать ключи", callback_data="export_keys")],
+                        [InlineKeyboardButton("↩️ Меню", callback_data="menu")],
+                    ]),
+                )
+                return
+            logger.warning("edit_message_text failed: %s", exc)
+            try:
+                await query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            except Exception as inner:
+                logger.warning("fallback reply failed: %s", inner)
+        except Exception as exc:
+            logger.warning("edit_message_text error: %s", exc)
+
+    async def _show_keys_list(self, query):
+        with self.db_session() as db:
+            keys = db.query(APIKey).order_by(APIKey.id.asc()).all()
+        if not keys:
+            await self._safe_edit(
+                query,
+                "📋 Нет созданных ключей\n\nЗагрузите файл бэкапа, если ключи были раньше.",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📤 Загрузить ключи", callback_data="import_keys")],
+                    [InlineKeyboardButton("↩️ Меню", callback_data="menu")],
+                ]),
+            )
+            return
+        await self._safe_edit(query, self._build_keys_message(keys), self._keys_action_keyboard(keys))
+
+    def _create_key_record(self, *, name: str, days: int, limit: Optional[int], created_by: int) -> Tuple[Optional[APIKey], Optional[str], Optional[str]]:
+        key_value = generate_api_key_value()
+        expires_at = datetime.utcnow() + timedelta(days=days) if days and days > 0 else None
+        try:
+            with self.db_session() as db:
+                api_key = APIKey(
+                    key=key_value,
+                    key_hash=hash_key(key_value),
+                    name=str(name)[:255],
+                    expires_at=expires_at,
+                    search_limit=limit,
+                    created_by=created_by,
+                )
+                db.add(api_key)
+                db.commit()
+                db.refresh(api_key)
+                return api_key, key_value, None
+        except IntegrityError:
+            logger.exception("duplicate api key")
+            return None, None, "Не удалось создать уникальный ключ, попробуйте ещё раз."
+        except SQLAlchemyError:
+            logger.exception("create key db error")
+            return None, None, "Ошибка базы данных при создании ключа."
+        except Exception as exc:
+            logger.exception("create key failed")
+            return None, None, f"Не удалось создать ключ: {exc}"
+
+    def _created_key_text(self, api_key: APIKey, key_value: str) -> str:
+        text = "✅ Ключ успешно создан!\n\n"
+        text += "🔑 <b>Ваш API ключ:</b>\n"
+        text += f"<code>{self._esc(key_value)}</code>\n\n"
+        text += f"📝 Название: {self._esc(api_key.name)}\n"
+        if api_key.expires_at:
+            text += f"⏰ Истекает: {api_key.expires_at.strftime('%d.%m.%Y %H:%M')}\n"
+        else:
+            text += "⏰ Срок: без ограничений\n"
+        text += f"🔍 Лимит поисков: {api_key.search_limit if api_key.search_limit else 'Безлимит'}\n\n"
+        text += "Ключ также виден в разделе «Мои ключи». Скачайте файл бэкапа, чтобы не потерять его после пересборки."
+        return text
+
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id if update.effective_user else 0
+        try:
+            if not self._is_admin(user_id):
+                await update.message.reply_text("🚫 У вас нет доступа к этому боту.")
+                return
             await update.message.reply_text(
                 "👋 Добро пожаловать в GloomApi Bot!\n\n"
-                "🔍 Универсальное API для поиска по данным\n\n"
-                "Выберите действие:",
-                reply_markup=reply_markup
+                "Ключи имеют префикс <code>plut_</code>.\n"
+                "Скачайте файл с ключами перед пересборкой хоста и загрузите его после деплоя.",
+                reply_markup=self._menu_keyboard(),
+                parse_mode="HTML",
             )
-            
-            print(f"✅ EXIT start_command for user {user_id}")
-        except Exception as e:
-            print(f"❌ ERROR in start_command for user {user_id}: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
-    
+        except Exception:
+            logger.exception("start_command failed for %s", user_id)
+            if update.message:
+                try:
+                    await update.message.reply_text("Не удалось открыть меню. Попробуйте /start ещё раз.")
+                except Exception:
+                    pass
+
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка нажатий на кнопки"""
         query = update.callback_query
-        await query.answer()
-        
-        user_id = update.effective_user.id
-        data = query.data
-        print(f"🚀 ENTER button_callback for user {user_id}, data: {data}")
-        
+        if not query:
+            return
         try:
-            if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
-                await query.edit_message_text("🚫 Этот бот доступен только для администраторов.")
-                print(f"✅ EXIT button_callback for user {user_id} (access denied)")
+            await query.answer()
+        except Exception:
+            pass
+
+        user_id = update.effective_user.id if update.effective_user else 0
+        data = query.data or ""
+        try:
+            if not self._is_admin(user_id):
+                await self._safe_edit(query, "🚫 Этот бот доступен только для администраторов.")
                 return
-            
+
             if data == "create_key":
                 context.user_data["state"] = "creating_key_name"
-                await query.edit_message_text(
-                    "🔑 Создание нового ключа\n\n"
-                    "Введите название для ключа:"
-                )
-            
+                await self._safe_edit(query, "🔑 Создание нового ключа\n\nВведите название для ключа:")
+
             elif data == "list_keys":
-                db = self.get_db()
-                # Показываем все ключи (только для админов)
-                keys = db.query(APIKey).all()
-                
-                if not keys:
-                    await query.edit_message_text("📋 Нет созданных ключей")
-                    print(f"✅ EXIT button_callback for user {user_id} (no keys)")
-                    return
-                
-                text = "📋 Все ключи:\n\n"
-                keyboard = []
-                
-                for key in keys:
-                    status_emoji = "✅" if key.status == "active" else "❌"
-                    text += f"{status_emoji} <b>{key.name}</b>\n"
-                    text += f"   Ключ: <code>sk_{key.key[:8]}...{key.key[-4:]}</code>\n"
-                    text += f"   Использовано: {key.searches_used}"
-                    if key.search_limit:
-                        text += f"/{key.search_limit}"
-                    text += "\n"
-                    if key.expires_at:
-                        text += f"   Истекает: {key.expires_at.strftime('%d.%m.%Y %H:%M')}\n"
-                    text += "\n"
-                    
-                    # Добавляем кнопки для управления ключом
-                    key_buttons = []
-                    if key.status == "active":
-                        key_buttons.append(InlineKeyboardButton("🚫 Деактивировать", callback_data=f"deactivate_key_{key.id}"))
-                    else:
-                        key_buttons.append(InlineKeyboardButton("✅ Активировать", callback_data=f"activate_key_{key.id}"))
-                    key_buttons.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{key.id}"))
-                    key_buttons.append(InlineKeyboardButton("📊 Логи", callback_data=f"key_logs_{key.id}"))
-                    keyboard.append(key_buttons)
-                
-                keyboard.append([InlineKeyboardButton("↩️ Меню", callback_data="menu")])
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
-            
-            elif data == "stats":
-                db = self.get_db()
-                total_keys = db.query(APIKey).count()
-                active_keys = db.query(APIKey).filter(APIKey.status == "active").count()
-                total_searches = db.query(APIKey).with_entities(func.sum(APIKey.searches_used)).scalar() or 0
-                
-                text = "📊 Статистика системы:\n\n"
-                text += f"🔑 Всего ключей: {total_keys}\n"
-                text += f"✅ Активных ключей: {active_keys}\n"
-                text += f"🔍 Всего поисков: {total_searches}\n"
-                
-                keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(text, reply_markup=reply_markup)
-            
-            elif data == "help":
-                text = "❓ Помощь\n\n"
-                text += "🔑 <b>Создать ключ</b> - Создать новый API ключ\n"
-                text += "📋 <b>Мои ключи</b> - Посмотреть список ваших ключей\n"
-                text += "📊 <b>Статистика</b> - Общая статистика системы\n\n"
-                text += "Для использования ключа в запросах:\n"
-                text += "<code>Authorization: Bearer YOUR_API_KEY</code>\n"
-                
-                keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
-            
-            elif data == "menu":
-                keyboard = [
-                    [InlineKeyboardButton("🔑 Создать ключ", callback_data="create_key")],
-                    [InlineKeyboardButton("📋 Мои ключи", callback_data="list_keys")],
-                    [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
-                    [InlineKeyboardButton("❓ Помощь", callback_data="help")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(
-                    "👋 Главное меню\n\nВыберите действие:",
-                    reply_markup=reply_markup
+                await self._show_keys_list(query)
+
+            elif data == "export_keys":
+                await self._export_keys_file(query)
+
+            elif data == "import_keys":
+                context.user_data["state"] = "awaiting_keys_file"
+                await self._safe_edit(
+                    query,
+                    "📤 Отправьте файл с ключами.\n\n"
+                    "Поддерживается JSON-бэкап с бота или текстовый список "
+                    "(<code>plut_...</code> / <code>sk_...</code>, по одному на строку).\n\n"
+                    "Существующие ключи не затираются — добавляются только новые.",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]),
                 )
-            
-            # Обработка действий с ключами
+
+            elif data == "stats":
+                with self.db_session() as db:
+                    total_keys = db.query(APIKey).count()
+                    active_keys = db.query(APIKey).filter(APIKey.status == "active").count()
+                    total_searches = db.query(APIKey).with_entities(func.sum(APIKey.searches_used)).scalar() or 0
+                text = (
+                    "📊 Статистика системы:\n\n"
+                    f"🔑 Всего ключей: {total_keys}\n"
+                    f"✅ Активных ключей: {active_keys}\n"
+                    f"🔍 Всего поисков: {total_searches}\n"
+                )
+                await self._safe_edit(
+                    query,
+                    text,
+                    InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]),
+                    parse_mode=None,
+                )
+
+            elif data == "help":
+                text = (
+                    "❓ Помощь\n\n"
+                    "🔑 <b>Создать ключ</b> — новый ключ с префиксом <code>plut_</code>\n"
+                    "📋 <b>Мои ключи</b> — полный список значений\n"
+                    "📥 <b>Скачать ключи</b> — JSON-файл для бэкапа перед пересборкой\n"
+                    "📤 <b>Загрузить ключи</b> — восстановить ключи из файла после деплоя\n"
+                    "📊 <b>Статистика</b> — количество ключей и поисков\n\n"
+                    "Использование:\n"
+                    "<code>Authorization: Bearer plut_...</code>"
+                )
+                await self._safe_edit(
+                    query,
+                    text,
+                    InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]),
+                )
+
+            elif data == "menu":
+                context.user_data.pop("state", None)
+                await self._safe_edit(query, "👋 Главное меню\n\nВыберите действие:", self._menu_keyboard(), parse_mode=None)
+
             elif data.startswith("deactivate_key_"):
-                key_id = int(data.split("_")[-1])
-                db = self.get_db()
-                key = db.query(APIKey).filter(APIKey.id == key_id).first()
-                if key:
-                    key.status = "inactive"
-                    db.commit()
-                    await query.answer("Ключ деактивирован")
-                    # Обновляем список напрямую без рекурсии
-                    keys = db.query(APIKey).all()
-                    text = "📋 Все ключи:\n\n"
-                    keyboard = []
-                    
-                    for k in keys:
-                        status_emoji = "✅" if k.status == "active" else "❌"
-                        text += f"{status_emoji} <b>{k.name}</b>\n"
-                        text += f"   Ключ: <code>sk_{k.key[:8]}...{k.key[-4:]}</code>\n"
-                        text += f"   Использовано: {k.searches_used}"
-                        if k.search_limit:
-                            text += f"/{k.search_limit}"
-                        text += "\n"
-                        if k.expires_at:
-                            text += f"   Истекает: {k.expires_at.strftime('%d.%m.%Y %H:%M')}\n"
-                        text += "\n"
-                        
-                        key_buttons = []
-                        if k.status == "active":
-                            key_buttons.append(InlineKeyboardButton("🚫 Деактивировать", callback_data=f"deactivate_key_{k.id}"))
-                        else:
-                            key_buttons.append(InlineKeyboardButton("✅ Активировать", callback_data=f"activate_key_{k.id}"))
-                        key_buttons.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{k.id}"))
-                        key_buttons.append(InlineKeyboardButton("📊 Логи", callback_data=f"key_logs_{k.id}"))
-                        keyboard.append(key_buttons)
-                    
-                    keyboard.append([InlineKeyboardButton("↩️ Меню", callback_data="menu")])
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
-                else:
-                    await query.answer("Ключ не найден", show_alert=True)
-            
+                await self._set_key_status(query, data, "inactive", "Ключ деактивирован")
+
             elif data.startswith("activate_key_"):
-                key_id = int(data.split("_")[-1])
-                db = self.get_db()
-                key = db.query(APIKey).filter(APIKey.id == key_id).first()
-                if key:
-                    key.status = "active"
-                    db.commit()
-                    await query.answer("Ключ активирован")
-                    # Обновляем список напрямую без рекурсии
-                    keys = db.query(APIKey).all()
-                    text = "📋 Все ключи:\n\n"
-                    keyboard = []
-                    
-                    for k in keys:
-                        status_emoji = "✅" if k.status == "active" else "❌"
-                        text += f"{status_emoji} <b>{k.name}</b>\n"
-                        text += f"   Ключ: <code>sk_{k.key[:8]}...{k.key[-4:]}</code>\n"
-                        text += f"   Использовано: {k.searches_used}"
-                        if k.search_limit:
-                            text += f"/{k.search_limit}"
-                        text += "\n"
-                        if k.expires_at:
-                            text += f"   Истекает: {k.expires_at.strftime('%d.%m.%Y %H:%M')}\n"
-                        text += "\n"
-                        
-                        key_buttons = []
-                        if k.status == "active":
-                            key_buttons.append(InlineKeyboardButton("🚫 Деактивировать", callback_data=f"deactivate_key_{k.id}"))
-                        else:
-                            key_buttons.append(InlineKeyboardButton("✅ Активировать", callback_data=f"activate_key_{k.id}"))
-                        key_buttons.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{k.id}"))
-                        key_buttons.append(InlineKeyboardButton("📊 Логи", callback_data=f"key_logs_{k.id}"))
-                        keyboard.append(key_buttons)
-                    
-                    keyboard.append([InlineKeyboardButton("↩️ Меню", callback_data="menu")])
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
-                else:
-                    await query.answer("Ключ не найден", show_alert=True)
-            
+                await self._set_key_status(query, data, "active", "Ключ активирован")
+
             elif data.startswith("delete_key_"):
-                key_id = int(data.split("_")[-1])
-                db = self.get_db()
-                key = db.query(APIKey).filter(APIKey.id == key_id).first()
-                
-                if not key:
-                    await query.answer("Ключ не найден", show_alert=True)
-                    return
-                
-                db.delete(key)
-                db.commit()
-                await query.answer("Ключ удален")
-                # Обновляем список напрямую без рекурсии
-                keys = db.query(APIKey).all()
-                
-                if not keys:
-                    await query.edit_message_text("📋 Нет созданных ключей")
-                    return
-                
-                text = "📋 Все ключи:\n\n"
-                keyboard = []
-                
-                for k in keys:
-                    status_emoji = "✅" if k.status == "active" else "❌"
-                    text += f"{status_emoji} <b>{k.name}</b>\n"
-                    text += f"   Ключ: <code>sk_{k.key[:8]}...{k.key[-4:]}</code>\n"
-                    text += f"   Использовано: {k.searches_used}"
-                    if k.search_limit:
-                        text += f"/{k.search_limit}"
-                    text += "\n"
-                    if k.expires_at:
-                        text += f"   Истекает: {k.expires_at.strftime('%d.%m.%Y %H:%M')}\n"
-                    text += "\n"
-                    
-                    key_buttons = []
-                    if k.status == "active":
-                        key_buttons.append(InlineKeyboardButton("🚫 Деактивировать", callback_data=f"deactivate_key_{k.id}"))
-                    else:
-                        key_buttons.append(InlineKeyboardButton("✅ Активировать", callback_data=f"activate_key_{k.id}"))
-                    key_buttons.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_key_{k.id}"))
-                    key_buttons.append(InlineKeyboardButton("📊 Логи", callback_data=f"key_logs_{k.id}"))
-                    keyboard.append(key_buttons)
-                
-                keyboard.append([InlineKeyboardButton("↩️ Меню", callback_data="menu")])
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
-            
+                await self._delete_key(query, data)
+
             elif data.startswith("key_logs_"):
-                
-                key_id = int(data.split("_")[-1])
-                db = self.get_db()
-                key = db.query(APIKey).filter(APIKey.id == key_id).first()
-                if key:
-                    logs = db.query(SearchLog).filter(SearchLog.api_key_id == key_id).order_by(SearchLog.created_at.desc()).limit(20).all()
-                    
-                    text = f"📊 Логи ключа: {key.name}\n\n"
-                    if not logs:
-                        text += "Нет записей"
-                    else:
-                        for log in logs:
-                            params = json.loads(log.search_params)
-                            text += f"🔍 {log.created_at.strftime('%d.%m.%Y %H:%M')}\n"
-                            text += f"   Параметры: {', '.join(params.keys())}\n"
-                            text += f"   Результатов: {log.results_count}\n"
-                            if log.source_api_key:
-                                text += f"   API ключ: {log.source_api_key}\n"
-                            text += "\n"
-                    
-                    keyboard = [[InlineKeyboardButton("↩️ Назад к ключам", callback_data="list_keys")]]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    await query.edit_message_text(text, reply_markup=reply_markup)
-                else:
-                    await query.answer("Ключ не найден", show_alert=True)
-            
-            print(f"✅ EXIT button_callback for user {user_id}")
-        except Exception as e:
-            print(f"❌ ERROR in button_callback for user {user_id}: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
-    
-    async def message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка текстовых сообщений"""
-        user_id = update.effective_user.id
-        text = update.message.text
-        state = context.user_data.get("state")
-        print(f"🚀 ENTER message_handler for user {user_id}, state: {state}, text: {text[:30]}")
-        
+                await self._show_key_logs(query, data)
+
+            else:
+                await query.answer("Неизвестная команда", show_alert=True)
+        except Exception:
+            logger.exception("button_callback failed for %s data=%s", user_id, data)
+            try:
+                await query.answer("Ошибка обработки. Попробуйте ещё раз.", show_alert=True)
+            except Exception:
+                pass
+
+    async def _set_key_status(self, query, data: str, status: str, ok_text: str):
         try:
-            if ADMIN_TELEGRAM_IDS and user_id not in ADMIN_TELEGRAM_IDS:
-                await update.message.reply_text("🚫 Этот бот доступен только для администраторов.")
-                print(f"✅ EXIT message_handler for user {user_id} (access denied)")
+            key_id = int(data.rsplit("_", 1)[-1])
+        except (TypeError, ValueError):
+            await query.answer("Некорректный идентификатор ключа", show_alert=True)
+            return
+        with self.db_session() as db:
+            key = db.query(APIKey).filter(APIKey.id == key_id).first()
+            if not key:
+                await query.answer("Ключ не найден", show_alert=True)
                 return
-            
+            key.status = status
+            db.commit()
+        await query.answer(ok_text)
+        await self._show_keys_list(query)
+
+    async def _delete_key(self, query, data: str):
+        try:
+            key_id = int(data.rsplit("_", 1)[-1])
+        except (TypeError, ValueError):
+            await query.answer("Некорректный идентификатор ключа", show_alert=True)
+            return
+        with self.db_session() as db:
+            key = db.query(APIKey).filter(APIKey.id == key_id).first()
+            if not key:
+                await query.answer("Ключ не найден", show_alert=True)
+                return
+            db.delete(key)
+            db.commit()
+        await query.answer("Ключ удалён")
+        await self._show_keys_list(query)
+
+    async def _show_key_logs(self, query, data: str):
+        try:
+            key_id = int(data.rsplit("_", 1)[-1])
+        except (TypeError, ValueError):
+            await query.answer("Некорректный идентификатор ключа", show_alert=True)
+            return
+        with self.db_session() as db:
+            key = db.query(APIKey).filter(APIKey.id == key_id).first()
+            if not key:
+                await query.answer("Ключ не найден", show_alert=True)
+                return
+            logs = (
+                db.query(SearchLog)
+                .filter(SearchLog.api_key_id == key_id)
+                .order_by(SearchLog.created_at.desc())
+                .limit(20)
+                .all()
+            )
+            text = f"📊 Логи ключа: {self._esc(key.name)}\n"
+            text += f"Ключ: <code>{self._esc(key.key)}</code>\n\n"
+            if not logs:
+                text += "Нет записей"
+            else:
+                for log in logs:
+                    try:
+                        params = json.loads(log.search_params or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        params = {}
+                    created = log.created_at.strftime("%d.%m.%Y %H:%M") if log.created_at else "?"
+                    text += f"🔍 {created}\n"
+                    if isinstance(params, dict) and params:
+                        text += f"   Параметры: {self._esc(', '.join(map(str, params.keys())))}\n"
+                    text += f"   Результатов: {log.results_count}\n\n"
+        keyboard = [[InlineKeyboardButton("↩️ Назад к ключам", callback_data="list_keys")]]
+        if len(text) > TELEGRAM_HTML_LIMIT:
+            text = text[: TELEGRAM_HTML_LIMIT - 20] + "\n…"
+        await self._safe_edit(query, text, InlineKeyboardMarkup(keyboard))
+
+    async def _export_keys_file(self, query):
+        with self.db_session() as db:
+            keys = db.query(APIKey).order_by(APIKey.id.asc()).all()
+        if not keys:
+            await query.answer("Нет ключей для выгрузки", show_alert=True)
+            return
+        payload = build_keys_backup(keys)
+        raw = json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        bio = BytesIO(raw)
+        filename = f"gloomapi_keys_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        try:
+            await query.message.reply_document(
+                document=InputFile(bio, filename=filename),
+                caption=(
+                    f"📥 Бэкап ключей: {len(keys)} шт.\n"
+                    "Сохраните файл и загрузите его в бота после пересборки хоста."
+                ),
+            )
+            await query.answer("Файл отправлен")
+        except Forbidden:
+            await query.answer("Бот не может отправить файл. Напишите /start.", show_alert=True)
+        except TelegramError as exc:
+            logger.warning("export document failed: %s", exc)
+            await query.answer("Не удалось отправить файл", show_alert=True)
+
+    async def message_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.message or not update.message.text:
+            return
+        user_id = update.effective_user.id if update.effective_user else 0
+        text = update.message.text.strip()
+        state = (context.user_data or {}).get("state")
+        try:
+            if not self._is_admin(user_id):
+                await update.message.reply_text("🚫 Этот бот доступен только для администраторов.")
+                return
+
             if state == "creating_key_name":
+                if not text or len(text) > 255:
+                    await update.message.reply_text("❌ Название должно быть от 1 до 255 символов.")
+                    return
                 context.user_data["key_name"] = text
                 context.user_data["state"] = "creating_key_days"
-                
                 keyboard = [
                     [InlineKeyboardButton("7 дней", callback_data="days_7")],
                     [InlineKeyboardButton("30 дней", callback_data="days_30")],
@@ -4931,260 +5454,248 @@ class TelegramBotManager:
                     [InlineKeyboardButton("180 дней", callback_data="days_180")],
                     [InlineKeyboardButton("365 дней", callback_data="days_365")],
                     [InlineKeyboardButton("Без ограничений", callback_data="days_0")],
-                    [InlineKeyboardButton("✏️ Свое число дней", callback_data="days_custom")]
+                    [InlineKeyboardButton("✏️ Свое число дней", callback_data="days_custom")],
                 ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
                 await update.message.reply_text(
-                    f"📝 Название: {text}\n\n"
-                    "⏰ Выберите срок действия ключа:",
-                    reply_markup=reply_markup
+                    f"📝 Название: {self._esc(text)}\n\n⏰ Выберите срок действия ключа:",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode="HTML",
                 )
-                print(f"✅ EXIT message_handler for user {user_id} (creating_key_name)")
-            
-            elif state == "creating_key_days_custom":
+                return
+
+            if state == "creating_key_days_custom":
                 try:
                     days = int(text)
-                    if days < 1:
-                        await update.message.reply_text("❌ Количество дней должно быть положительным числом")
-                        print(f"⚠️ EXIT message_handler for user {user_id} (invalid days)")
-                        return
-                    
-                    context.user_data["key_days"] = days
-                    context.user_data["state"] = "creating_key_limit"
-                    
-                    keyboard = [
-                        [InlineKeyboardButton("100", callback_data="limit_100")],
-                        [InlineKeyboardButton("1000", callback_data="limit_1000")],
-                        [InlineKeyboardButton("10000", callback_data="limit_10000")],
-                        [InlineKeyboardButton("Безлимит", callback_data="limit_0")]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    
-                    await update.message.reply_text(
-                        f"⏰ Срок: {days} дней\n\n"
-                        "🔢 Выберите лимит поисков или введите своё число:",
-                        reply_markup=reply_markup
-                    )
-                    print(f"✅ EXIT message_handler for user {user_id} (custom days)")
-                    
                 except ValueError:
-                    await update.message.reply_text("❌ Введите корректное число")
-                    print(f"⚠️ EXIT message_handler for user {user_id} (invalid number)")
-            
-            elif state == "creating_key_limit":
+                    await update.message.reply_text("❌ Введите целое число дней.")
+                    return
+                if days < 1 or days > 3650:
+                    await update.message.reply_text("❌ Количество дней — от 1 до 3650.")
+                    return
+                context.user_data["key_days"] = days
+                context.user_data["state"] = "creating_key_limit"
+                await update.message.reply_text(
+                    f"⏰ Срок: {days} дней\n\n🔢 Выберите лимит поисков или введите своё число:",
+                    reply_markup=self._limit_keyboard(),
+                )
+                return
+
+            if state == "creating_key_limit":
                 try:
                     limit = int(text)
-                    if limit < 1:
-                        await update.message.reply_text("❌ Лимит должен быть положительным числом")
-                        print(f"⚠️ EXIT message_handler for user {user_id} (invalid limit)")
-                        return
-                    
-                    context.user_data["key_limit"] = limit
-                    
-                    # Создаем ключ
-                    db = self.get_db()
-                    key_value = f"sk_{secrets.token_urlsafe(32)}"
-                    key_hash = hash_key(key_value)
-                    
-                    days = context.user_data.get("key_days", 30)
-                    expires_at = datetime.utcnow() + timedelta(days=days) if days > 0 else None
-                    
-                    api_key = APIKey(
-                        key=key_value,
-                        key_hash=key_hash,
-                        name=context.user_data["key_name"],
-                        expires_at=expires_at,
-                        search_limit=limit,
-                        created_by=user_id
-                    )
-                    db.add(api_key)
-                    db.commit()
-                    db.refresh(api_key)
-                    
-                    text = f"✅ Ключ успешно создан!\n\n"
-                    text += f"🔑 <b>Ваш API ключ:</b>\n"
-                    text += f"<code>{key_value}</code>\n\n"
-                    text += f"📝 Название: {api_key.name}\n"
-                    if expires_at:
-                        text += f"⏰ Истекает: {expires_at.strftime('%d.%m.%Y %H:%M')}\n"
-                    text += f"🔍 Лимит поисков: {limit}\n\n"
-                    text += "⚠️ Сохраните этот ключ, он больше не будет показан!"
-                    
-                    keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    
-                    context.user_data.clear()
-                    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
-                    print(f"✅ EXIT message_handler for user {user_id} (key created)")
-                    
                 except ValueError:
-                    await update.message.reply_text("❌ Введите корректное число")
-                    print(f"⚠️ EXIT message_handler for user {user_id} (invalid number)")
-            
-            print(f"✅ EXIT message_handler for user {user_id}")
-        except Exception as e:
-            print(f"❌ ERROR in message_handler for user {user_id}: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
-    
+                    await update.message.reply_text("❌ Введите корректное число лимита.")
+                    return
+                if limit < 1 or limit > 10_000_000:
+                    await update.message.reply_text("❌ Лимит — от 1 до 10000000.")
+                    return
+                await self._finish_key_creation(update, context, user_id, limit)
+                return
+
+            if state == "awaiting_keys_file":
+                await update.message.reply_text("Отправьте документ (файл), а не текст.")
+                return
+
+            await update.message.reply_text("Выберите действие в меню или отправьте /start.", reply_markup=self._menu_keyboard())
+        except Exception:
+            logger.exception("message_handler failed for %s", user_id)
+            try:
+                await update.message.reply_text("Ошибка обработки сообщения. Попробуйте ещё раз.")
+            except Exception:
+                pass
+
+    def _limit_keyboard(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("100", callback_data="limit_100")],
+            [InlineKeyboardButton("1000", callback_data="limit_1000")],
+            [InlineKeyboardButton("10000", callback_data="limit_10000")],
+            [InlineKeyboardButton("Безлимит", callback_data="limit_0")],
+        ])
+
+    async def _finish_key_creation(self, update, context, user_id: int, limit: Optional[int], via_query=None):
+        name = (context.user_data or {}).get("key_name")
+        if not name:
+            msg = "Сначала введите название ключа через «Создать ключ»."
+            if via_query:
+                await self._safe_edit(via_query, msg, self._menu_keyboard(), parse_mode=None)
+            elif update.message:
+                await update.message.reply_text(msg, reply_markup=self._menu_keyboard())
+            return
+        days = int((context.user_data or {}).get("key_days") or 0)
+        api_key, key_value, error = self._create_key_record(name=name, days=days, limit=limit, created_by=user_id)
+        context.user_data.clear()
+        if error or not api_key or not key_value:
+            text = error or "Не удалось создать ключ."
+            if via_query:
+                await self._safe_edit(via_query, text, self._menu_keyboard(), parse_mode=None)
+            elif update.message:
+                await update.message.reply_text(text, reply_markup=self._menu_keyboard())
+            return
+        text = self._created_key_text(api_key, key_value)
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Меню", callback_data="menu")]])
+        if via_query:
+            await self._safe_edit(via_query, text, markup)
+        elif update.message:
+            await update.message.reply_text(text, reply_markup=markup, parse_mode="HTML")
+
     async def days_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка выбора срока действия"""
         query = update.callback_query
-        await query.answer()
-        
-        user_id = update.effective_user.id
-        days_str = query.data.replace("days_", "")
-        
-        print(f"🚀 ENTER days_callback for user {user_id}, data: {query.data}")
-        
+        if not query:
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        user_id = update.effective_user.id if update.effective_user else 0
+        if not self._is_admin(user_id):
+            await self._safe_edit(query, "🚫 Нет доступа.")
+            return
+        days_str = (query.data or "").replace("days_", "", 1)
         try:
             if days_str == "custom":
                 context.user_data["state"] = "creating_key_days_custom"
-                await query.edit_message_text(
-                    "✏️ Введите количество дней (число):"
-                )
-                print(f"✅ EXIT days_callback for user {user_id} (custom days)")
+                await self._safe_edit(query, "✏️ Введите количество дней (число):")
                 return
-            
             days = int(days_str)
+            if days < 0 or days > 3650:
+                await query.answer("Некорректный срок", show_alert=True)
+                return
             context.user_data["key_days"] = days
-            
             context.user_data["state"] = "creating_key_limit"
-            
-            keyboard = [
-                [InlineKeyboardButton("100", callback_data="limit_100")],
-                [InlineKeyboardButton("1000", callback_data="limit_1000")],
-                [InlineKeyboardButton("10000", callback_data="limit_10000")],
-                [InlineKeyboardButton("Безлимит", callback_data="limit_0")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await query.edit_message_text(
-                f"⏰ Срок: {days if days > 0 else 'Без ограничений'} дней\n\n"
-                "🔢 Выберите лимит поисков или введите своё число:",
-                reply_markup=reply_markup
+            label = "Без ограничений" if days == 0 else f"{days} дней"
+            await self._safe_edit(
+                query,
+                f"⏰ Срок: {label}\n\n🔢 Выберите лимит поисков или введите своё число:",
+                self._limit_keyboard(),
+                parse_mode=None,
             )
-            
-            print(f"✅ EXIT days_callback for user {user_id}")
-        except Exception as e:
-            print(f"❌ ERROR in days_callback for user {user_id}: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
-    
+        except Exception:
+            logger.exception("days_callback failed")
+            try:
+                await query.answer("Ошибка выбора срока", show_alert=True)
+            except Exception:
+                pass
+
     async def limit_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка выбора лимита"""
         query = update.callback_query
-        await query.answer()
-        
-        user_id = update.effective_user.id
-        limit_str = query.data.replace("limit_", "")
-        limit = int(limit_str) if limit_str != "0" else None
-        print(f"🚀 ENTER limit_callback for user {user_id}, limit: {limit}")
-        
-        try:
-            context.user_data["key_limit"] = limit
-            
-            # Создаем ключ
-            db = self.get_db()
-            key_value = f"sk_{secrets.token_urlsafe(32)}"
-            key_hash = hash_key(key_value)
-            
-            days = context.user_data.get("key_days", 30)
-            expires_at = datetime.utcnow() + timedelta(days=days) if days > 0 else None
-            
-            api_key = APIKey(
-                key=key_value,
-                key_hash=key_hash,
-                name=context.user_data["key_name"],
-                expires_at=expires_at,
-                search_limit=limit,
-                created_by=query.from_user.id
-            )
-            db.add(api_key)
-            db.commit()
-            db.refresh(api_key)
-            
-            text = f"✅ Ключ успешно создан!\n\n"
-            text += f"🔑 <b>Ваш API ключ:</b>\n"
-            text += f"<code>{key_value}</code>\n\n"
-            text += f"📝 Название: {api_key.name}\n"
-            if expires_at:
-                text += f"⏰ Истекает: {expires_at.strftime('%d.%m.%Y %H:%M')}\n"
-            text += f"🔍 Лимит поисков: {limit if limit else 'Безлимит'}\n\n"
-            text += "⚠️ Сохраните этот ключ, он больше не будет показан!"
-            
-            keyboard = [[InlineKeyboardButton("↩️ Меню", callback_data="menu")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            context.user_data.clear()
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
-            
-            print(f"✅ EXIT limit_callback for user {user_id}")
-        except Exception as e:
-            print(f"❌ ERROR in limit_callback for user {user_id}: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
-    
-    async def run_async(self):
-        """Асинхронный запуск бота с polling для FastAPI"""
-        import traceback
-        
-        if not TELEGRAM_BOT_TOKEN:
-            print("⚠️ TELEGRAM_BOT_TOKEN не установлен. Бот не запущен.")
+        if not query:
             return
-        
         try:
-            print("🔧 Создание Application...")
+            await query.answer()
+        except Exception:
+            pass
+        user_id = update.effective_user.id if update.effective_user else 0
+        if not self._is_admin(user_id):
+            await self._safe_edit(query, "🚫 Нет доступа.")
+            return
+        try:
+            limit_str = (query.data or "").replace("limit_", "", 1)
+            limit = int(limit_str) if limit_str != "0" else None
+            if limit is not None and (limit < 1 or limit > 10_000_000):
+                await query.answer("Некорректный лимит", show_alert=True)
+                return
+            await self._finish_key_creation(update, context, user_id, limit, via_query=query)
+        except Exception:
+            logger.exception("limit_callback failed")
+            try:
+                await query.answer("Ошибка создания ключа", show_alert=True)
+            except Exception:
+                pass
+
+    async def document_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.message or not update.message.document:
+            return
+        user_id = update.effective_user.id if update.effective_user else 0
+        if not self._is_admin(user_id):
+            await update.message.reply_text("🚫 Этот бот доступен только для администраторов.")
+            return
+        state = (context.user_data or {}).get("state")
+        doc = update.message.document
+        filename = (doc.file_name or "").lower()
+        looks_like_backup = "key" in filename or filename.endswith(".json") or filename.endswith(".txt")
+        if state != "awaiting_keys_file" and not looks_like_backup:
+            await update.message.reply_text(
+                "Чтобы восстановить ключи, нажмите «Загрузить ключи» и пришлите файл.",
+                reply_markup=self._menu_keyboard(),
+            )
+            return
+        if doc.file_size and doc.file_size > KEYS_BACKUP_MAX_BYTES:
+            await update.message.reply_text("❌ Файл больше 512 КБ.")
+            return
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            raw = bytes(await tg_file.download_as_bytearray())
+            items = parse_keys_backup(raw)
+            with self.db_session() as db:
+                stats = import_api_keys(db, items, created_by=user_id)
+            context.user_data.pop("state", None)
+            await update.message.reply_text(
+                "✅ Импорт завершён.\n\n"
+                f"Добавлено: {stats['added']}\n"
+                f"Пропущено (уже есть): {stats['skipped']}\n"
+                f"Ошибок: {stats['failed']}",
+                reply_markup=self._menu_keyboard(),
+            )
+        except ValueError as exc:
+            await update.message.reply_text(f"❌ {exc}")
+        except TelegramError as exc:
+            logger.warning("document download failed: %s", exc)
+            await update.message.reply_text("Не удалось скачать файл из Telegram. Попробуйте ещё раз.")
+        except Exception:
+            logger.exception("document_handler failed")
+            await update.message.reply_text("Не удалось обработать файл. Проверьте формат JSON/TXT.")
+
+    async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        logger.exception("telegram handler error: %s", context.error)
+        try:
+            if isinstance(update, Update) and update.effective_message:
+                await update.effective_message.reply_text("Произошла внутренняя ошибка. Попробуйте ещё раз.")
+        except Exception:
+            pass
+
+    async def run_async(self):
+        if not TELEGRAM_BOT_TOKEN:
+            logger.warning("TELEGRAM_BOT_TOKEN не установлен. Бот не запущен.")
+            return
+
+        try:
             self.application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-            print("✅ Application создан")
-            
-            # Регистрация обработчиков
-            print("📝 Регистрация обработчиков...")
             self.application.add_handler(CommandHandler("start", self.start_command))
             self.application.add_handler(CallbackQueryHandler(self.days_callback, pattern="^days_"))
             self.application.add_handler(CallbackQueryHandler(self.limit_callback, pattern="^limit_"))
             self.application.add_handler(CallbackQueryHandler(self.button_callback))
+            self.application.add_handler(MessageHandler(filters.Document.ALL, self.document_handler))
             self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.message_handler))
-            print("✅ Обработчики зарегистрированы")
-            
-            # Инициализация и запуск в существующем event loop
-            print("🚀 Инициализация Application...")
+            self.application.add_error_handler(self.on_error)
+
             await self.application.initialize()
-            print("✅ Application инициализирован")
-            
-            print("🚀 Запуск Application...")
             await self.application.start()
-            print("✅ Application запущен")
-            
-            # Запуск polling через updater
-            print("🚀 Запуск polling через updater...")
             await self.application.updater.start_polling(drop_pending_updates=True)
-            print("✅ Polling запущен")
-            
-            # Бесконечный цикл для поддержания работы
-            print("🔄 Бот работает в режиме polling...")
-            while self.application.updater.is_running:
+            logger.info("Telegram bot polling started")
+            while self.application.updater and self.application.updater.is_running:
                 await asyncio.sleep(1)
-                
         except asyncio.CancelledError:
-            print("🛑 Polling отменен (CancelledError)")
+            logger.info("Telegram polling cancelled")
             raise
-        except Exception as e:
-            print(f"❌ Ошибка в polling: {e}")
-            print(f"📋 Traceback:\n{traceback.format_exc()}")
+        except Exception:
+            logger.exception("Telegram polling failed")
             raise
         finally:
-            print("🛑 Остановка Telegram бота...")
             if self.application:
-                if self.application.updater.is_running:
-                    await self.application.updater.stop()
-                await self.application.stop()
-                await self.application.shutdown()
-            print("✅ Telegram бот остановлен")
+                try:
+                    if self.application.updater and self.application.updater.is_running:
+                        await self.application.updater.stop()
+                except Exception:
+                    logger.warning("updater stop failed", exc_info=True)
+                try:
+                    await self.application.stop()
+                except Exception:
+                    logger.warning("application stop failed", exc_info=True)
+                try:
+                    await self.application.shutdown()
+                except Exception:
+                    logger.warning("application shutdown failed", exc_info=True)
+            logger.info("Telegram bot stopped")
 
 if __name__ == "__main__":
     import uvicorn
