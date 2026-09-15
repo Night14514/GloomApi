@@ -81,6 +81,9 @@ _default_trust_proxy = "1" if os.path.exists("/data") else "0"
 TRUST_PROXY = os.getenv("TRUST_PROXY", _default_trust_proxy) == "1"
 MAX_QUERY_VALUE_LEN = int(os.getenv("MAX_QUERY_VALUE_LEN", "500"))
 MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "500"))
+MAX_RESULT_DATA_BYTES = int(os.getenv("MAX_RESULT_DATA_BYTES", "24000"))
+MAX_RESULT_LIST_ITEMS = int(os.getenv("MAX_RESULT_LIST_ITEMS", "80"))
+MAX_RESULT_DEPTH = int(os.getenv("MAX_RESULT_DEPTH", "6"))
 OUTPUT_DIR = os.getenv(
     "OUTPUT_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs"),
@@ -479,6 +482,11 @@ GERHANO_API_KEY = "ns-MVzUx4QtfyiQrQ72qTOz2UoZWeiHMa1f"
 LOCALSEARCH_BASE_URL = os.getenv("LOCALSEARCH_BASE_URL", "http://192.99.16.76:5009")
 NETSPY_API_KEY = os.getenv("NETSPY_API_KEY", "ns-ecwKK6MKcguV8vQa3QUwgbUzKu6vvfxj")
 NETSPY_BASE_URL = os.getenv("NETSPY_BASE_URL", "https://netspy.sbs")
+OMENGRAM_TOKEN = os.getenv(
+    "OMENGRAM_TOKEN",
+    "OMG-sTTWc5YrY0IS4YDE1I4PwMqK9Td9Pq8bXOB4QUcZpfxO5KO7Wlc2H9eviOkvc_j1",
+)
+OMENGRAM_BASE_URL = os.getenv("OMENGRAM_BASE_URL", "https://omen.bot.cd")
 API_KEY_PREFIX = "plut_"
 LEGACY_API_KEY_PREFIX = "sk_"
 KEYS_BACKUP_MAX_BYTES = 512 * 1024
@@ -592,6 +600,224 @@ def _result_err(source: str, field: str, value: Any, error: Any) -> Dict[str, An
     }
 
 
+_GRAPH_NOISE_KEYS = {
+    "edges", "connection_score", "connection_direct", "connection_self",
+    "evidence", "source_ids", "record_ids", "dataset_count", "year_from", "year_to",
+    "kind", "entity_id", "subtitle", "provenance", "evidence_ids", "weight",
+}
+
+
+def _mask_ratio(text: str) -> float:
+    s = str(text or "")
+    if not s:
+        return 1.0
+    stars = s.count("*")
+    if stars == 0:
+        return 0.0
+    visible = sum(ch.isalnum() for ch in s)
+    return stars / float(max(1, stars + visible))
+
+
+def _is_placeholder_text(text: Any) -> bool:
+    s = str(text or "").strip()
+    if not s:
+        return True
+    if s in (".", "..", "...", "—", "-"):
+        return True
+    if _mask_ratio(s) >= 0.35 and s.count("*") >= 3:
+        return True
+    # «Связанный объект» без полезного значения
+    if s.lower() in ("связанный объект", "related entity", "unknown"):
+        return True
+    return False
+
+
+def _looks_entity_node(node: Any) -> bool:
+    if not isinstance(node, dict):
+        return False
+    if node.get("kind") == "entity" or node.get("entity_id"):
+        return True
+    if node.get("type") in ("person", "phone", "email", "realty", "address", "car", "document"):
+        return "title" in node or "subtitle" in node
+    return False
+
+
+def _looks_entity_list(items: Any) -> bool:
+    if not isinstance(items, list) or not items:
+        return False
+    sample = [x for x in items[:8] if isinstance(x, dict)]
+    if not sample:
+        return False
+    return sum(1 for x in sample if _looks_entity_node(x)) >= max(1, len(sample) // 2)
+
+
+def _compact_entity(node: dict) -> Optional[dict]:
+    title = node.get("title") or node.get("value") or node.get("name") or node.get("query")
+    if _is_placeholder_text(title):
+        return None
+    etype = node.get("type")
+    if etype in (None, "", "entity"):
+        etype = node.get("kind") if node.get("kind") not in (None, "entity") else None
+    out: Dict[str, Any] = {}
+    if etype:
+        out["type"] = str(etype)
+    out["value"] = str(title).strip()
+    details = node.get("details")
+    if isinstance(details, dict):
+        cleaned = {
+            str(k): v for k, v in details.items()
+            if v not in (None, "", [], {}) and not _is_placeholder_text(v)
+        }
+        if cleaned:
+            out["details"] = cleaned
+    elif isinstance(details, list) and details:
+        kept = [x for x in details[:20] if not _is_placeholder_text(x)]
+        if kept:
+            out["details"] = kept
+    return out
+
+
+def _compact_graph_nodes(nodes: List[Any]) -> List[dict]:
+    records: List[dict] = []
+    seen = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        rec = _compact_entity(node)
+        if not rec:
+            continue
+        key = (rec.get("type"), rec.get("value"))
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append(rec)
+        if len(records) >= MAX_RESULT_LIST_ITEMS:
+            break
+    return records
+
+
+def _extract_graph_payload(data: dict) -> Optional[dict]:
+    """Сжимает graph-dump (nodes/edges/entity) в список полезных записей."""
+    if not isinstance(data, dict):
+        return None
+
+    def from_nodes(nodes: list, extra_total: Optional[int] = None) -> Optional[dict]:
+        records = _compact_graph_nodes(nodes)
+        return {
+            "records": records,
+            "records_kept": len(records),
+            "records_total": extra_total if extra_total is not None else len(nodes),
+            "graph_compacted": True,
+        }
+
+    for key in ("nodes", "entities", "items", "vertices"):
+        nodes = data.get(key)
+        if isinstance(nodes, list) and (data.get("edges") is not None or _looks_entity_list(nodes)):
+            return from_nodes(nodes)
+
+    for wrap in ("data", "response", "result", "payload", "graph", "content"):
+        inner = data.get(wrap)
+        if isinstance(inner, dict):
+            got = _extract_graph_payload(inner)
+            if got is not None:
+                return got
+        elif isinstance(inner, list) and (_looks_entity_list(inner) or data.get("edges") is not None):
+            return from_nodes(inner)
+
+    # сам объект — сущность
+    if _looks_entity_node(data) and "edges" not in data:
+        rec = _compact_entity(data)
+        if rec:
+            return {"records": [rec], "records_kept": 1, "records_total": 1, "graph_compacted": True}
+    return None
+
+
+def sanitize_module_data(data: Any, depth: int = 0) -> Any:
+    """Убирает graph-мусор, маски и служебные поля из ответов источников."""
+    if depth > MAX_RESULT_DEPTH:
+        return None
+    if data is None:
+        return None
+    if isinstance(data, (int, float, bool)):
+        return data
+    if isinstance(data, str):
+        if _is_placeholder_text(data):
+            return None
+        return data if len(data) <= 2000 else data[:2000] + "…"
+    if isinstance(data, list):
+        if _looks_entity_list(data):
+            records = _compact_graph_nodes(data)
+            return records or None
+        out = []
+        for item in data[:MAX_RESULT_LIST_ITEMS]:
+            cleaned = sanitize_module_data(item, depth + 1)
+            if cleaned not in (None, "", [], {}):
+                out.append(cleaned)
+        return out or None
+    if isinstance(data, dict):
+        graph = _extract_graph_payload(data)
+        if graph is not None:
+            return graph if graph.get("records") else None
+        out: Dict[str, Any] = {}
+        for raw_key, value in data.items():
+            key = str(raw_key)
+            if key in _GRAPH_NOISE_KEYS or key.startswith("_"):
+                continue
+            cleaned = sanitize_module_data(value, depth + 1)
+            if cleaned in (None, "", [], {}):
+                continue
+            out[key[:64]] = cleaned
+            if len(out) >= 60:
+                break
+        return out or None
+    text = str(data)
+    return text[:500] if text else None
+
+
+def _cap_data_size(data: Any) -> Any:
+    try:
+        blob = json.dumps(data, ensure_ascii=False, default=str)
+    except Exception:
+        return data
+    if len(blob.encode("utf-8")) <= MAX_RESULT_DATA_BYTES:
+        return data
+    if isinstance(data, dict) and isinstance(data.get("records"), list):
+        records = data["records"]
+        while records and len(json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")) > MAX_RESULT_DATA_BYTES:
+            records.pop()
+        data["truncated"] = True
+        data["records_kept"] = len(records)
+        return data
+    if isinstance(data, list):
+        trimmed = list(data)
+        while trimmed and len(json.dumps(trimmed, ensure_ascii=False, default=str).encode("utf-8")) > MAX_RESULT_DATA_BYTES:
+            trimmed.pop()
+        return trimmed
+    return {"truncated": True, "preview": blob[:MAX_RESULT_DATA_BYTES]}
+
+
+def data_is_useful(data: Any) -> bool:
+    if data in (None, "", [], {}, False):
+        return False
+    if isinstance(data, dict) and data.get("graph_compacted") and not data.get("records"):
+        return False
+    return True
+
+
+def _clean_module_hits(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cleaned: List[Dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict) or not row.get("found"):
+            continue
+        data = sanitize_module_data(row.get("data"))
+        if not data_is_useful(data):
+            continue
+        item = dict(row)
+        item["data"] = _cap_data_size(data)
+        cleaned.append(item)
+    return cleaned
+
+
 class CircuitBreaker:
     """Автопропуск мёртвых API после серии ошибок (DNS/timeout/5xx)."""
 
@@ -629,7 +855,7 @@ class CircuitBreaker:
 circuit_breaker = CircuitBreaker()
 HTTP_SESSION = requests.Session()
 HTTP_SESSION.headers.update({
-    "User-Agent": "GloomApi/2.2",
+    "User-Agent": "GloomApi/2.3",
     "Accept": "application/json, text/plain, */*",
 })
 _http_retry = Retry(
@@ -3508,6 +3734,135 @@ class NetSpyModule(BaseSearchModule):
         return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
 
 
+class OmengramModule(BaseSearchModule):
+    """Omengram — POST /v1/omengram/info
+
+    Документированный контракт:
+      Header X-Omengram-Token
+      Body {"query": "...", "type": "auto"|phone|fio|email|...}
+    """
+
+    SUPPORTED_FIELDS = [
+        "phone", "number", "email", "fio", "fullname", "name", "nick", "username",
+        "telegram", "vk", "vk_id", "inn", "snils", "passport", "vin", "car_number",
+        "ip", "address",
+    ]
+    TIMEOUT = 25.0
+    TYPE_MAP = {
+        "phone": "phone",
+        "number": "phone",
+        "email": "email",
+        "fio": "fio",
+        "fullname": "fio",
+        "name": "fio",
+        "nick": "username",
+        "username": "username",
+        "telegram": "telegram",
+        "vk": "vk",
+        "vk_id": "vk",
+        "inn": "inn",
+        "snils": "snils",
+        "passport": "passport",
+        "vin": "auto",
+        "car_number": "auto",
+        "ip": "ip",
+        "address": "address",
+    }
+
+    def __init__(self):
+        self.base_url = OMENGRAM_BASE_URL.rstrip("/") + "/v1/omengram/info"
+        self.token = OMENGRAM_TOKEN
+
+    def _prepare_query(self, field: str, value: str) -> Optional[str]:
+        value = str(value).strip()
+        if not value:
+            return None
+        if field in ("phone", "number"):
+            return normalize_phone(value) or value
+        if field == "telegram":
+            q = normalize_telegram_query(value).lstrip("@")
+            return q or None
+        if field in ("vk", "vk_id"):
+            return extract_vk_id(value)
+        if field in ("nick", "username"):
+            return value.lstrip("@")
+        return value
+
+    def _query(self, query: str, search_type: str) -> Tuple[Optional[dict], Optional[str]]:
+        last_error = None
+        types = [search_type] if search_type == "auto" else [search_type, "auto"]
+        seen_types = []
+        for stype in types:
+            if stype in seen_types:
+                continue
+            seen_types.append(stype)
+            response, err = self._post(
+                self.base_url,
+                json={"query": query, "type": stype},
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Omengram-Token": self.token,
+                    "Accept": "application/json",
+                },
+            )
+            if err and response is None:
+                last_error = err
+                continue
+            if response is None:
+                last_error = err or "no response"
+                continue
+            if response.status_code in (401, 403):
+                return None, f"auth HTTP {response.status_code}"
+            if response.status_code == 429:
+                return None, "rate_limited"
+            if response.status_code in (400, 422):
+                try:
+                    payload = response.json()
+                    last_error = str(payload.get("error") or payload.get("detail") or payload)[:300]
+                except Exception:
+                    last_error = f"HTTP {response.status_code}"
+                continue
+            if response.status_code != 200:
+                last_error = f"HTTP {response.status_code}"
+                continue
+            try:
+                data = response.json()
+            except Exception:
+                last_error = "invalid json"
+                continue
+            if isinstance(data, dict):
+                if data.get("error") and not data.get("data") and not data.get("result") and not data.get("info"):
+                    last_error = str(data.get("error"))
+                    continue
+                if data.get("success") is False and not data.get("data") and not data.get("result"):
+                    last_error = str(data.get("message") or data.get("detail") or "no data")
+                    continue
+            if data in (None, "", [], {}):
+                last_error = "empty"
+                continue
+            return data, None
+        return None, last_error or "Omengram unavailable"
+
+    def search(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        results = []
+        seen = set()
+        for field, search_type in self.TYPE_MAP.items():
+            value = params.get(field)
+            if not value:
+                continue
+            query = self._prepare_query(field, value)
+            cache_key = (search_type, query)
+            if not query or cache_key in seen:
+                continue
+            seen.add(cache_key)
+            data, error = self._query(query, search_type)
+            if data is not None:
+                results.append(_result_ok("omengram", field, value, data, method=search_type))
+            elif error:
+                logger.debug("Omengram %s/%s: %s", search_type, query, error)
+        return {"success": any(r.get("found") for r in results), "results": results, "total": len(results)}
+
+
 # ============================================================================
 # МОДУЛИ ИЗ Chronosphere (vv.py) — отсутствовавшие ранее
 # ============================================================================
@@ -4843,7 +5198,7 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
-app = FastAPI(title="GloomApi - Search API", version="2.2", lifespan=lifespan)
+app = FastAPI(title="GloomApi - Search API", version="2.3", lifespan=lifespan)
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -4973,6 +5328,7 @@ search_modules = [
     GerhanoModule(),
     LocalSearchModule(),
     NetSpyModule(),
+    OmengramModule(),
 ]
 
 # ============================================================================
@@ -5057,6 +5413,10 @@ def _run_single_module(module: BaseSearchModule, params: Dict[str, Any]) -> Dict
             return {"success": False, "results": [], "skipped": True, "module": name, "reason": reason}
         started = time()
         result = module.search(params) or {"success": False, "results": []}
+        hits = _clean_module_hits(result.get("results") or [])
+        result["results"] = hits
+        result["success"] = bool(hits)
+        result["total"] = len(hits)
         result["module"] = name
         result["elapsed_ms"] = int((time() - started) * 1000)
         return result
@@ -5091,8 +5451,13 @@ async def run_search_modules_parallel(params: Dict[str, Any]) -> Tuple[List[Dict
         "modules_skipped": len(skipped_pre),
         "modules_with_hits": 0,
         "elapsed_by_module": {},
-        "skipped": skipped_pre[:80],
+        "skipped": skipped_pre[:12],
+        "skipped_summary": {},
     }
+    reason_counts: Dict[str, int] = defaultdict(int)
+    for item in skipped_pre:
+        reason_counts[str(item.get("reason") or "other")] += 1
+    meta["skipped_summary"] = dict(reason_counts)
     if not to_run:
         return [], meta
 
@@ -5121,8 +5486,10 @@ async def run_search_modules_parallel(params: Dict[str, Any]) -> Tuple[List[Dict
             meta["elapsed_by_module"][name] = item["elapsed_ms"]
         if item.get("skipped"):
             meta["modules_skipped"] += 1
-            if len(meta["skipped"]) < 80:
+            if len(meta["skipped"]) < 12:
                 meta["skipped"].append({"module": name, "reason": item.get("reason")})
+                reason = str(item.get("reason") or "other")
+                meta["skipped_summary"][reason] = meta["skipped_summary"].get(reason, 0) + 1
             continue
         meta["modules_ran"] += 1
         hits = [row for row in (item.get("results") or []) if row.get("found")]
@@ -5365,7 +5732,7 @@ async def root():
     enabled = [m.__class__.__name__ for m in search_modules if getattr(m, "ENABLED", True)]
     return {
         "name": "GloomApi - Search API",
-        "version": "2.2",
+        "version": "2.3",
         "docs": "/docs",
         "modules_count": len(module_names),
         "modules_enabled": len(enabled),
