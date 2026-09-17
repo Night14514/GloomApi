@@ -81,9 +81,8 @@ _default_trust_proxy = "1" if os.path.exists("/data") else "0"
 TRUST_PROXY = os.getenv("TRUST_PROXY", _default_trust_proxy) == "1"
 MAX_QUERY_VALUE_LEN = int(os.getenv("MAX_QUERY_VALUE_LEN", "500"))
 MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "500"))
-MAX_RESULT_DATA_BYTES = int(os.getenv("MAX_RESULT_DATA_BYTES", "24000"))
-MAX_RESULT_LIST_ITEMS = int(os.getenv("MAX_RESULT_LIST_ITEMS", "80"))
-MAX_RESULT_DEPTH = int(os.getenv("MAX_RESULT_DEPTH", "6"))
+MAX_RESULT_DATA_BYTES = int(os.getenv("MAX_RESULT_DATA_BYTES", "120000"))
+MAX_RESULT_LIST_ITEMS = int(os.getenv("MAX_RESULT_LIST_ITEMS", "250"))
 OUTPUT_DIR = os.getenv(
     "OUTPUT_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs"),
@@ -600,90 +599,75 @@ def _result_err(source: str, field: str, value: Any, error: Any) -> Dict[str, An
     }
 
 
-_GRAPH_NOISE_KEYS = {
-    "edges", "connection_score", "connection_direct", "connection_self",
-    "evidence", "source_ids", "record_ids", "dataset_count", "year_from", "year_to",
-    "kind", "entity_id", "subtitle", "provenance", "evidence_ids", "weight",
+_GRAPH_ONLY_KEYS = {
+    "edges", "nodes", "entities", "vertices", "items",
 }
 
 
-def _mask_ratio(text: str) -> float:
-    s = str(text or "")
-    if not s:
-        return 1.0
-    stars = s.count("*")
-    if stars == 0:
-        return 0.0
-    visible = sum(ch.isalnum() for ch in s)
-    return stars / float(max(1, stars + visible))
+def _graph_node_list(data: dict) -> Optional[List[Any]]:
+    """Настоящий graph-dump: есть edges и список узлов. Иначе это обычный ответ API."""
+    if not isinstance(data, dict) or "edges" not in data:
+        return None
+    for key in ("nodes", "entities", "items", "vertices"):
+        nodes = data.get(key)
+        if isinstance(nodes, list):
+            return nodes
+    return None
 
 
-def _is_placeholder_text(text: Any) -> bool:
-    s = str(text or "").strip()
-    if not s:
-        return True
-    if s in (".", "..", "...", "—", "-"):
-        return True
-    if _mask_ratio(s) >= 0.35 and s.count("*") >= 3:
-        return True
-    # «Связанный объект» без полезного значения
-    if s.lower() in ("связанный объект", "related entity", "unknown"):
-        return True
-    return False
-
-
-def _looks_entity_node(node: Any) -> bool:
-    if not isinstance(node, dict):
-        return False
-    if node.get("kind") == "entity" or node.get("entity_id"):
-        return True
-    if node.get("type") in ("person", "phone", "email", "realty", "address", "car", "document"):
-        return "title" in node or "subtitle" in node
-    return False
-
-
-def _looks_entity_list(items: Any) -> bool:
-    if not isinstance(items, list) or not items:
-        return False
-    sample = [x for x in items[:8] if isinstance(x, dict)]
-    if not sample:
-        return False
-    return sum(1 for x in sample if _looks_entity_node(x)) >= max(1, len(sample) // 2)
-
-
-def _compact_entity(node: dict) -> Optional[dict]:
+def _slim_graph_node(node: dict) -> Optional[dict]:
+    """Оставляет запись графа, включая маски (*). Маски — штатный формат OSINT, не мусор."""
     title = node.get("title") or node.get("value") or node.get("name") or node.get("query")
-    if _is_placeholder_text(title):
+    if title is None:
+        return None
+    title_s = str(title).strip()
+    if not title_s:
+        return None
+    if title_s.lower() in ("связанный объект", "related entity"):
         return None
     etype = node.get("type")
     if etype in (None, "", "entity"):
-        etype = node.get("kind") if node.get("kind") not in (None, "entity") else None
+        kind = node.get("kind")
+        etype = kind if kind not in (None, "entity") else None
     out: Dict[str, Any] = {}
     if etype:
         out["type"] = str(etype)
-    out["value"] = str(title).strip()
+    out["value"] = title_s
     details = node.get("details")
-    if isinstance(details, dict):
-        cleaned = {
-            str(k): v for k, v in details.items()
-            if v not in (None, "", [], {}) and not _is_placeholder_text(v)
-        }
+    if isinstance(details, dict) and details:
+        cleaned = {str(k): v for k, v in details.items() if v not in (None, "", [], {})}
         if cleaned:
             out["details"] = cleaned
     elif isinstance(details, list) and details:
-        kept = [x for x in details[:20] if not _is_placeholder_text(x)]
-        if kept:
-            out["details"] = kept
+        out["details"] = details[:40]
     return out
 
 
-def _compact_graph_nodes(nodes: List[Any]) -> List[dict]:
+def _compact_graph_dump(data: dict) -> Optional[dict]:
+    nodes = _graph_node_list(data)
+    if nodes is None:
+        inner = data.get("data")
+        if isinstance(inner, dict):
+            compacted = _compact_graph_dump(inner)
+            if compacted is not None:
+                rest = {k: v for k, v in data.items() if k != "data"}
+                rest["data"] = compacted
+                return rest
+        graph = data.get("graph")
+        if isinstance(graph, dict):
+            compacted = _compact_graph_dump(graph)
+            if compacted is not None:
+                rest = {k: v for k, v in data.items() if k != "graph"}
+                rest["graph"] = compacted
+                return rest
+        return None
+
     records: List[dict] = []
     seen = set()
     for node in nodes:
         if not isinstance(node, dict):
             continue
-        rec = _compact_entity(node)
+        rec = _slim_graph_node(node)
         if not rec:
             continue
         key = (rec.get("type"), rec.get("value"))
@@ -693,85 +677,18 @@ def _compact_graph_nodes(nodes: List[Any]) -> List[dict]:
         records.append(rec)
         if len(records) >= MAX_RESULT_LIST_ITEMS:
             break
-    return records
 
-
-def _extract_graph_payload(data: dict) -> Optional[dict]:
-    """Сжимает graph-dump (nodes/edges/entity) в список полезных записей."""
-    if not isinstance(data, dict):
-        return None
-
-    def from_nodes(nodes: list, extra_total: Optional[int] = None) -> Optional[dict]:
-        records = _compact_graph_nodes(nodes)
-        return {
-            "records": records,
-            "records_kept": len(records),
-            "records_total": extra_total if extra_total is not None else len(nodes),
-            "graph_compacted": True,
-        }
-
-    for key in ("nodes", "entities", "items", "vertices"):
-        nodes = data.get(key)
-        if isinstance(nodes, list) and (data.get("edges") is not None or _looks_entity_list(nodes)):
-            return from_nodes(nodes)
-
-    for wrap in ("data", "response", "result", "payload", "graph", "content"):
-        inner = data.get(wrap)
-        if isinstance(inner, dict):
-            got = _extract_graph_payload(inner)
-            if got is not None:
-                return got
-        elif isinstance(inner, list) and (_looks_entity_list(inner) or data.get("edges") is not None):
-            return from_nodes(inner)
-
-    # сам объект — сущность
-    if _looks_entity_node(data) and "edges" not in data:
-        rec = _compact_entity(data)
-        if rec:
-            return {"records": [rec], "records_kept": 1, "records_total": 1, "graph_compacted": True}
-    return None
-
-
-def sanitize_module_data(data: Any, depth: int = 0) -> Any:
-    """Убирает graph-мусор, маски и служебные поля из ответов источников."""
-    if depth > MAX_RESULT_DEPTH:
-        return None
-    if data is None:
-        return None
-    if isinstance(data, (int, float, bool)):
-        return data
-    if isinstance(data, str):
-        if _is_placeholder_text(data):
-            return None
-        return data if len(data) <= 2000 else data[:2000] + "…"
-    if isinstance(data, list):
-        if _looks_entity_list(data):
-            records = _compact_graph_nodes(data)
-            return records or None
-        out = []
-        for item in data[:MAX_RESULT_LIST_ITEMS]:
-            cleaned = sanitize_module_data(item, depth + 1)
-            if cleaned not in (None, "", [], {}):
-                out.append(cleaned)
-        return out or None
-    if isinstance(data, dict):
-        graph = _extract_graph_payload(data)
-        if graph is not None:
-            return graph if graph.get("records") else None
-        out: Dict[str, Any] = {}
-        for raw_key, value in data.items():
-            key = str(raw_key)
-            if key in _GRAPH_NOISE_KEYS or key.startswith("_"):
-                continue
-            cleaned = sanitize_module_data(value, depth + 1)
-            if cleaned in (None, "", [], {}):
-                continue
-            out[key[:64]] = cleaned
-            if len(out) >= 60:
-                break
-        return out or None
-    text = str(data)
-    return text[:500] if text else None
+    extra = {
+        k: v for k, v in data.items()
+        if k not in _GRAPH_ONLY_KEYS and v not in (None, "", [], {})
+        and not isinstance(v, (list, dict))
+    }
+    out = dict(extra)
+    out["records"] = records
+    out["records_kept"] = len(records)
+    out["records_total"] = len(nodes)
+    out["graph_compacted"] = True
+    return out
 
 
 def _cap_data_size(data: Any) -> Any:
@@ -779,7 +696,8 @@ def _cap_data_size(data: Any) -> Any:
         blob = json.dumps(data, ensure_ascii=False, default=str)
     except Exception:
         return data
-    if len(blob.encode("utf-8")) <= MAX_RESULT_DATA_BYTES:
+    encoded = blob.encode("utf-8")
+    if len(encoded) <= MAX_RESULT_DATA_BYTES:
         return data
     if isinstance(data, dict) and isinstance(data.get("records"), list):
         records = data["records"]
@@ -793,13 +711,22 @@ def _cap_data_size(data: Any) -> Any:
         while trimmed and len(json.dumps(trimmed, ensure_ascii=False, default=str).encode("utf-8")) > MAX_RESULT_DATA_BYTES:
             trimmed.pop()
         return trimmed
-    return {"truncated": True, "preview": blob[:MAX_RESULT_DATA_BYTES]}
+    return data
+
+
+def compact_module_data(data: Any) -> Any:
+    """Режет только graph edges. Не выкидывает маскированные OSINT-записи и обычные JSON-ответы."""
+    if isinstance(data, dict):
+        compacted = _compact_graph_dump(data)
+        if compacted is not None:
+            return compacted
+    return data
 
 
 def data_is_useful(data: Any) -> bool:
     if data in (None, "", [], {}, False):
         return False
-    if isinstance(data, dict) and data.get("graph_compacted") and not data.get("records"):
+    if isinstance(data, dict) and data.get("graph_compacted") and not data.get("records") and len(data) <= 3:
         return False
     return True
 
@@ -809,7 +736,7 @@ def _clean_module_hits(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for row in rows or []:
         if not isinstance(row, dict) or not row.get("found"):
             continue
-        data = sanitize_module_data(row.get("data"))
+        data = compact_module_data(row.get("data"))
         if not data_is_useful(data):
             continue
         item = dict(row)
